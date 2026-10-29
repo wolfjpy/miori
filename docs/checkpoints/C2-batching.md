@@ -241,3 +241,147 @@ neutral. The next required change is **packed/batched prefill** (concatenate
 requests, block-diagonal attention, per-request conv state), not more kernel
 tuning; at 64 short prompts the current serial prefill is ~2.3 s of the 3.5 s
 wall time.
+
+## Packed multi-request prefill (added)
+
+`BatchEngine::add_batch()` prefills N prompts in one pass. The prompts are
+concatenated into a single `[T][2048]` activation buffer, each of the 24 layers
+runs its GEMMs **once over all T rows** on the MPP tensor cores, and only the
+request-boundary work stays per request:
+
+- **Shared GEMMs.** `gemm_mpp` over the existing 2.93 GB bf16 cache for q/k/v/o,
+  conv in/out and the FFN (`M = T`, padded to the 64-row tile); `gemm_naive` for
+  the N = 16 attention gate and for the QK/PV per-request attention.
+- **Request-local positions.** A `[T]` position buffer (`row - request_start`)
+  drives RoPE via the existing `rope_batch` kernel and the new
+  `kv_write_packed` kernel, which writes post-RoPE K (bf16) and V straight into
+  each destination slot's KV cache — the per-head KV copies of `add_sequence`
+  (1.2–2.4 ms/prompt) are gone.
+- **Per-request attention.** For each request, its own token range is attended
+  against its own slot KV only (block-diagonal by construction — a request can
+  never see another's tokens). Chunks of 128 rows, relative `start_pos` and the
+  256-token sliding mask reproduce `Engine::prefill_ids`'s score-matrix widths
+  exactly.
+- **Per-request conv.** `conv7` is called per request on slices of the packed
+  `gated`/`bcx` buffers (new `conv7_off` wrapper, byte offsets), with a zero
+  6-token window at the request start and the resulting state written directly
+  into the slot's live double-buffer half.
+- **First token.** Final RMSNorm over all T rows, the last row of every request
+  gathered into a `[kBmax][2048]` buffer (`gather_rows`), then the same 8-bit
+  `gemv8_b` kernel as the decode path (4 rows per dispatch, same accumulation
+  order as the single-sequence `gemv8`) — 1 exact lm_head pass instead of 64.
+- **Limits.** At most `kBmax` = 32 requests and `kPackRows` = 1024 concatenated
+  tokens per pass; `add_batch` groups the input accordingly and falls back to
+  `add_sequence` for any prompt longer than 1024 tokens (or longer than the
+  4096-position slot). Packed activations cost 175 MB.
+
+`add_sequence`, `decode_step`, the server's default path and the vision path are
+unchanged; the packed prefill is opt-in in the server via
+`MIORI_BATCH_PREFILL=1` (default off).
+
+### Exactness
+
+The MPP GEMM result per element does not depend on the M tile shape:
+`test-mpp-tile` runs the same 23-row A through `gemm_mpp32` (32-row tile, the
+sequential path's kernel for T ≤ 32) and `gemm_mpp` (64-row tile):
+
+```
+test-mpp-tile: N=6144 K=2048, rows 0..22 of 64
+gemm_mpp32(M=23) vs gemm_mpp(M=23)         0/141312 differ, max abs diff 0
+gemm_mpp(M=23) vs gemm_mpp(M=64)           0/141312 differ, max abs diff 0
+```
+
+Everything else in the packed pass reuses the single-sequence kernels with
+identical per-row math, so the packed path is bit-identical:
+
+```
+./build/miori batch-prefill-test --n 64 --repeat 5 --state-check 4 --long 423
+batch-prefill-test: 64 prompts, 23..24 tokens (mean 23.2, total 1484), 2 wave(s) of <= 32
+sequential Engine::prefill_ids : 2.095 s median (min 2.090 max 2.121) = 708 tok/s
+packed BatchEngine::add_batch  : 0.669 s median (min 0.669 max 0.690) = 2218 tok/s
+prefill speedup: 3.13x (32.73 -> 10.46 ms per request)
+first tokens: 64/64 identical
+first-token logits: 0/8192000 elements differ, max |diff| = 0
+state check: 6/6 requests byte-identical (KV + conv state)
+```
+
+The state check compares, byte for byte, every used KV position of all 11
+attention layers and the 6 x 2048 conv state of all 13 conv layers against the
+state `Engine::prefill_ids` leaves behind for the same prompt (518 KB of KV per
+23-token prompt, 639 KB of conv state per request).
+
+Long prompt (several 128-token chunks, sliding layers past their 256-token
+window), packed together with a short prompt in one `add_batch` call:
+
+```
+long prompt: 431 tokens + 23-token prompt in one add_batch call: 155.2 ms
+  first tokens: 2/2 identical, logits 0/256000 differ (2 packed request(s)), max |diff| 0
+  state check: 9,709,568 KV bytes and 638,976 conv bytes identical on both requests
+```
+
+A 1009-token prompt + a 23-token prompt (over the row budget, so it is split
+into two packed passes) is also 2/2 first-token identical with 0 differing
+logits; a 1213-token prompt exercises the `> kPackRows` fallback: first token
+and KV/conv state still identical.
+
+### Measured (packed prefill)
+
+| Scenario | sequential `prefill_ids` | packed `add_batch` | speedup |
+|---|---:|---:|---:|
+| 64 x 23-token prompts (2 passes of 32) | 2.095 s / 708 tok/s | **0.669 s / 2218 tok/s** | **3.13x** |
+| 423–431-token prompt + 23-token prompt | 0.42 s (0.40 + 0.02) | 0.155 s | 2.7x |
+| one 1009-token prompt | ~0.40 s | 0.40 s | 1.0x (no packing gain) |
+| one 23-token prompt | 32.7 ms | 10–12 ms | 2.8x |
+
+64 concurrent HTTP requests (23-token prompts, greedy, `max_tokens` 16), same
+binary, same request file, 4 runs each, median:
+
+| server | wall clock | responses |
+|---|---:|---|
+| default | **2.94 s** (3.06 / 2.95 / 2.92 / 2.94) | — |
+| `MIORI_BATCH_PREFILL=1` | **1.51 s** (1.60 / 1.50 / 1.51 / 1.49) | byte-identical (md5 match) |
+
+The scheduler still uses Bmax = 32, so the 64 requests are two waves; each wave
+now pays one packed prefill (~0.33 s for 32 x 23 tokens) instead of 32
+sequential prefills (~1.05 s). What is left of the 1.5 s is the decode: two
+waves x 10 output tokens x ~59 ms MPP step.
+
+### What is missing
+
+- **Bmax = 32** caps a packed pass at 32 requests; 64 concurrent prompts take
+  two passes (the fixed per-pass overhead is small but the GEMM tile padding and
+  the ~1.5 k extra launches of the per-request attention/conv loops are paid
+  twice). A prefill-only staging buffer > kBmax slots would merge them.
+- **kPackRows = 1024**: prompts longer than that still go through
+  `add_sequence` (correct, not packed). Chunked/streaming packing would let a
+  long prompt's 128-token chunks share the GEMM tiles with short prompts.
+- **No mixed prefill/decode step.** A packed pass blocks the batch (the
+  scheduler prefills, then decodes); continuous chunked prefill is still
+  missing. This is the next latency win for a steady stream of arrivals.
+- **Per-request dispatch loops.** Attention (3 launches per request chunk per
+  attention layer) and conv (1 launch per request per conv layer) are not fused;
+  at 32 short requests that is ~1.5 k extra launches, roughly 2% of the packed
+  pass. Boundary-aware packed conv7 and per-request-offset attention kernels
+  would remove them.
+- **No packing gain for a single long prompt** (1009 tokens: 0.40 s either
+  way); the per-request attention is the same work.
+- **The MPP GEMM is now the cost**: the packed pass runs at ~6.6 TFLOPS
+  effective (64x64 tiles). An M-first dispatch order (to share weight tiles in
+  L2) was tried and measured neutral (0.669 -> 0.665 s, within noise) and
+  reverted; a larger M tile per threadgroup is the next lever.
+- `batch-test --kernels gemv4` remains broken since kBmax was raised to 32
+  (`gemv4_b`/`gemv8_b` return early for B > 4). Pre-existing, unrelated to the
+  packed prefill; the 4-bit batched path needs a B ≤ 4 mode to be usable again.
+
+### New command
+
+```
+./build/miori batch-prefill-test [--n 64] [--repeat 3] [--state-check 4] \
+    [--long 423] [--words]
+```
+
+Runs the 64-prompt and long-prompt comparisons above, prints first-token ids,
+logits diff, KV/conv state diff and wall times. `--words` uses ~29-token
+question prompts instead of the default ~23-token single-word turns.
+`MIORI_BATCH_KEEP_LOGITS=1` (set by the test itself) keeps each request's
+first-token logits across packed passes so they can be diffed.

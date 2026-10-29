@@ -52,6 +52,36 @@ bool BatchEngine::init(std::string& err) {
         tokb_ = buf(64 * 4);
         posb_ = buf(64 * 4);
 
+        // ---- packed prefill activations ([kPackRows] rows)
+        pxb_ = buf((size_t)kPackRows * kHidden * 4);
+        phb_ = buf((size_t)kPackRows * kHidden * 2);
+        pqb_ = buf((size_t)kPackRows * kQDim * 4);
+        pkb_ = buf((size_t)kPackRows * kKvDim * 4);
+        pvb_ = buf((size_t)kPackRows * kKvDim * 4);
+        pgb_ = buf((size_t)kPackRows * 16 * 4);
+        pqnb_ = buf((size_t)kPackRows * kQDim * 2);
+        pknb_ = buf((size_t)kPackRows * kKvDim * 2);
+        pab_ = buf((size_t)kPackRows * kHidden * 4);
+        pagb_ = buf((size_t)kPackRows * kHidden * 2);
+        ppb_ = buf((size_t)kPackRows * kHidden * 4);
+        pfgb_ = buf((size_t)kPackRows * kFfn * 4);
+        pfub_ = buf((size_t)kPackRows * kFfn * 4);
+        pfactb_ = buf((size_t)kPackRows * kFfn * 2);
+        pdb_ = buf((size_t)kPackRows * kHidden * 4);
+        pbcxb_ = buf((size_t)kPackRows * 3 * kHidden * 4);
+        pgatedb_ = buf((size_t)kPackRows * kHidden * 4);
+        phlastb_ = buf((size_t)kBmax * kHidden * 2);
+        pscores_ = buf((size_t)kPackChunk * kMaxSeq * 4);
+        pscores_bf_ = buf((size_t)kPackChunk * kMaxSeq * 2);
+        ppzero_ = buf((size_t)kConvState * 4);
+        ptok_ = buf((size_t)kPackRows * 4);
+        pppos_ = buf((size_t)kPackRows * 4);
+        ppslot_ = buf((size_t)kPackRows * 4);
+        pprow_ = buf((size_t)kBmax * 4);
+        // Optional: keep each request's first-token logits across packed passes so
+        // batch-prefill-test can diff them against the sequential path.
+        if (getenv("MIORI_BATCH_KEEP_LOGITS")) plogits_ = buf((size_t)kBmax * kVocab * 4);
+
         const size_t slot_kv = (size_t)kKvHeads * kMaxSeq * kHeadDim * 2;  // 4 MB
         for (int l = 0; l < kLayers; ++l) {
             if (Engine::is_attention_layer(l)) {
@@ -69,7 +99,10 @@ bool BatchEngine::init(std::string& err) {
         // Padding rows stay zero for the lifetime of the engine.
         for (MTL::Buffer* b : {xb_, hb_, qb_, kb_, vb_, gb_, qnb_, knb_, ab_, agb_, pb_,
                                fgb_, fub_, factb_, db_, bcxb_, gatedb_, hlastb_,
-                               logitsb_, embb_}) {
+                               logitsb_, embb_, pxb_, phb_, pqb_, pkb_, pvb_, pgb_, pqnb_,
+                               pknb_, pab_, pagb_, ppb_, pfgb_, pfub_, pfactb_, pdb_,
+                               pbcxb_, pgatedb_, phlastb_, pscores_, pscores_bf_,
+                               ppzero_, ptok_, pppos_, ppslot_, pprow_}) {
             memset(b->contents(), 0, (size_t)b->length());
         }
         memset(posb_->contents(), 0, 64 * 4);
@@ -84,14 +117,21 @@ bool BatchEngine::init(std::string& err) {
             m_.submit(cb_, true);
         }
 
-        size_t kv_bytes = 0, cs_bytes = 0;
+        size_t kv_bytes = 0, cs_bytes = 0, pack_bytes = 0;
         for (int l = 0; l < kLayers; ++l) {
             if (kc_[l]) kv_bytes += 2 * (size_t)kc_[l]->length();
             else cs_bytes += (size_t)cs_[l]->length();
         }
+        for (MTL::Buffer* b : {pxb_, phb_, pqb_, pkb_, pvb_, pgb_, pqnb_, pknb_, pab_, pagb_,
+                               ppb_, pfgb_, pfub_, pfactb_, pdb_, pbcxb_, pgatedb_,
+                               phlastb_, pscores_, pscores_bf_, ppzero_, ptok_, pppos_,
+                               ppslot_, pprow_})
+            pack_bytes += (size_t)b->length();
         printf("batch: Bmax=%d, slot KV %.1f MB total, conv state %.1f MB, logits %.1f MB\n",
                kBmax, kv_bytes / 1e6, cs_bytes / 1e6,
                (double)kBmax * kVocab * 4 / 1e6);
+        printf("batch: packed prefill rows=%d (%.1f MB activations), chunk=%d\n", kPackRows,
+               pack_bytes / 1e6, kPackChunk);
         ready_ = true;
     } catch (const std::exception& e) {
         err = std::string("BatchEngine: ") + e.what();
@@ -282,6 +322,261 @@ int BatchEngine::add_sequence(const std::vector<int>& prompt, int max_new_tokens
     sl.generated.push_back(first);
     if (first == kEosId || sl.max_new <= 1) sl.finished = true;
     return slot;
+}
+
+// ---- packed multi-request prefill -----------------------------------------
+//
+// N prompts are concatenated into one [T][2048] activation buffer. Every linear
+// layer then runs one MPP GEMM over all T rows; attention, KV writes and the
+// conv state update stay per request, on slices of the shared buffers. The
+// per-request work reproduces the single-sequence chunking exactly (128-token
+// attention chunks, zero conv state at the request start), so the first-token
+// logits are bit-identical to Engine::prefill_ids + Engine::sample.
+
+void BatchEngine::linear_p(MTL::Buffer* A, MTL::Buffer* C, const Proj& p, int T) {
+    gemm_mpp(m_, e_, A, eng_.bf16_buffer(), C, (uint32_t)T, p.N, p.K, p.off);
+}
+
+void BatchEngine::linear_gate_p(MTL::Buffer* A, MTL::Buffer* C, const Proj& p, int T) {
+    // N = 16 is not a multiple of 64: the cache holds this tensor row-major.
+    gemm_naive(m_, e_, A, eng_.bf16_buffer(), C, (uint32_t)T, p.N, p.K, kHidden,
+               p.K, p.N, 0, p.off, 0);
+}
+
+void BatchEngine::packed_ffn(int layer, int T) {
+    const uint32_t Tu = (uint32_t)T;
+    rmsnorm(m_, e_, pxb_, w_, *norm_ffn_[layer], phb_, Tu, kHidden, 1e-5f);
+    linear_p(phb_, pfgb_, lw_[layer].w1, T);
+    linear_p(phb_, pfub_, lw_[layer].w3, T);
+    silu_mul(m_, e_, pfgb_, pfub_, pfactb_, Tu * kFfn);
+    linear_p(pfactb_, pdb_, lw_[layer].w2, T);
+    postnorm_add(m_, e_, pxb_, pdb_, w_, *norm_post_ffn_[layer], pxb_, Tu, kHidden, 1e-5f);
+}
+
+void BatchEngine::packed_attn(int layer, const std::vector<std::vector<int>>& prompts,
+                              const std::vector<int>& slots, int T) {
+    const uint32_t Tu = (uint32_t)T;
+    rmsnorm(m_, e_, pxb_, w_, *norm_op_[layer], phb_, Tu, kHidden, 1e-5f);
+    linear_p(phb_, pqb_, lw_[layer].q, T);
+    linear_p(phb_, pkb_, lw_[layer].k, T);
+    linear_p(phb_, pvb_, lw_[layer].v, T);
+    linear_gate_p(phb_, pgb_, lw_[layer].gate, T);
+    rmsnorm(m_, e_, pqb_, w_, *norm_q_[layer], pqnb_, Tu * 16, kHeadDim, 1e-5f);
+    rmsnorm(m_, e_, pkb_, w_, *norm_k_[layer], pknb_, Tu * 4, kHeadDim, 1e-5f);
+    const int kind = Engine::layer_kind(layer);
+    const bool partial = (kind == 1);
+    const float theta = partial ? 1000000.0f : 10000.0f;
+    rope_batch(m_, e_, pqnb_, pknb_, pppos_, Tu, theta, partial);
+    kv_write_packed(m_, e_, pknb_, pvb_, kc_[layer], vc_[layer], ppslot_, pppos_, Tu,
+                    kMaxSeq, kKvHeads);
+
+    // Per-request attention on its own token range and slot KV. The chunking
+    // (and therefore the score-matrix width) matches Engine::prefill_ids.
+    int row = 0;
+    for (size_t r = 0; r < prompts.size(); ++r) {
+        const int len = (int)prompts[r].size();
+        const uint32_t slot = (uint32_t)slots[r];
+        for (int c = 0; c < len; c += kPackChunk) {
+            const int clen = std::min(kPackChunk, len - c);
+            const uint32_t seq = (uint32_t)(c + clen);
+            const uint32_t row0 = (uint32_t)(row + c);
+            for (uint32_t h = 0; h < 16; ++h) {
+                const uint32_t kvh = h / 4u;
+                const uint32_t kbase =
+                    ((slot * kKvHeads + kvh) * kMaxSeq * kHeadDim) * 2u;
+                const uint32_t vbase =
+                    ((slot * kKvHeads + kvh) * kHeadDim * kMaxSeq) * 2u;
+                // scores = q_chunk . K[0..seq)
+                gemm_naive(m_, e_, pqnb_, kc_[layer], pscores_, (uint32_t)clen, seq, 128,
+                           kHidden, kHeadDim, seq, (row0 * kHidden + h * kHeadDim) * 2u,
+                           kbase, 0);
+                softmax_prefill(m_, e_, pscores_, pscores_bf_, (uint32_t)clen, seq,
+                                (uint32_t)c, kind == 2);
+                // out_chunk = P . V[0..seq)
+                gemm_naive(m_, e_, pscores_bf_, vc_[layer], pab_, (uint32_t)clen, 128,
+                           seq, seq, kMaxSeq, kHidden, 0, vbase,
+                           (row0 * kHidden + h * kHeadDim) * 4u);
+            }
+        }
+        row += len;
+    }
+    gate_mul_b(m_, e_, pab_, pgb_, pagb_, Tu * kHidden);
+    linear_p(pagb_, ppb_, lw_[layer].o, T);
+    postnorm_add(m_, e_, pxb_, ppb_, w_, *norm_post_op_[layer], pxb_, Tu, kHidden, 1e-5f);
+    packed_ffn(layer, T);
+}
+
+void BatchEngine::packed_conv(int layer, const std::vector<std::vector<int>>& prompts,
+                              const std::vector<int>& slots, int T) {
+    const uint32_t Tu = (uint32_t)T;
+    rmsnorm(m_, e_, pxb_, w_, *norm_op_[layer], phb_, Tu, kHidden, 1e-5f);
+    linear_p(phb_, pbcxb_, lw_[layer].in, T);
+    conv_gate(m_, e_, pbcxb_, pgatedb_, Tu, kHidden);
+    // Per request: width-7 causal conv with zero state at the request start.
+    int row = 0;
+    for (size_t r = 0; r < prompts.size(); ++r) {
+        const uint32_t len = (uint32_t)prompts[r].size();
+        const uint32_t slot = (uint32_t)slots[r];
+        conv7_off(m_, e_, pgatedb_, (uint32_t)row * kHidden * 4u, pbcxb_,
+                  (uint32_t)row * 3u * kHidden * 4u, w_, *kernel_[layer], ppzero_,
+                  cs_[layer], ((slot * 2u + (uint32_t)cs_cur_[layer]) * kConvState) * 4u,
+                  phb_, (uint32_t)row * kHidden * 2u, len, kHidden);
+        row += (int)len;
+    }
+    // The packed pass is not a decode step, so the live half does not flip: the
+    // state lands in the same half add_sequence() copies into.
+    linear_p(phb_, ppb_, lw_[layer].out, T);
+    postnorm_add(m_, e_, pxb_, ppb_, w_, *norm_post_op_[layer], pxb_, Tu, kHidden, 1e-5f);
+    packed_ffn(layer, T);
+}
+
+bool BatchEngine::add_batch_pass(const std::vector<std::vector<int>>& prompts,
+                                 const std::vector<int>& slots,
+                                 const std::vector<int>& max_new) {
+    const int N = (int)prompts.size();
+    if (N <= 0 || N > kBmax || slots.size() != prompts.size()) return false;
+    int T = 0;
+    for (const auto& p : prompts) {
+        if (p.empty() || (int)p.size() > kMaxSeq - 1) return false;
+        T += (int)p.size();
+    }
+    if (T <= 0 || T > kPackRows) return false;
+
+    const auto t0 = std::chrono::steady_clock::now();
+    uint32_t* toks = (uint32_t*)ptok_->contents();
+    uint32_t* poss = (uint32_t*)pppos_->contents();
+    uint32_t* slotof = (uint32_t*)ppslot_->contents();
+    uint32_t* lastrows = (uint32_t*)pprow_->contents();
+    int row = 0;
+    for (int r = 0; r < N; ++r) {
+        const int len = (int)prompts[r].size();
+        for (int j = 0; j < len; ++j) {
+            toks[row] = (uint32_t)prompts[r][j];
+            poss[row] = (uint32_t)j;
+            slotof[row] = (uint32_t)slots[r];
+            ++row;
+        }
+        lastrows[r] = (uint32_t)(row - 1);
+    }
+
+    cb_ = m_.begin();
+    e_ = cb_->computeCommandEncoder();
+    embed8(m_, e_, w_, *emb_q_, *emb_s_, *emb_b_, ptok_, phb_, (uint32_t)T, kHidden);
+    to_f32(m_, e_, phb_, pxb_, (uint32_t)T * kHidden);
+    for (int l = 0; l < kLayers; ++l) {
+        if (Engine::is_attention_layer(l)) packed_attn(l, prompts, slots, T);
+        else packed_conv(l, prompts, slots, T);
+    }
+    rmsnorm(m_, e_, pxb_, w_, *norm_emb_, phb_, (uint32_t)T, kHidden, 1e-5f);
+    gather_rows(m_, e_, phb_, phlastb_, pprow_, (uint32_t)N, kHidden);
+    // Exact 8-bit lm_head for the last row of every request: same kernel and
+    // accumulation order as Engine::prefill_chunk's gemv8, 4 rows per dispatch.
+    const uint32_t rows4 = (uint32_t)((N + 3) / 4 * 4);
+    for (uint32_t r = 0; r < rows4; r += 4) {
+        gemv8_b_off(m_, e_, w_, *emb_q_, *emb_s_, *emb_b_, phlastb_, logitsb_, kVocab,
+                    kHidden, 4, r * kHidden * 2, r * kVocab * 4);
+    }
+    e_->endEncoding();
+    m_.submit(cb_, true);
+
+    const float* lg = (const float*)logitsb_->contents();
+    for (int r = 0; r < N; ++r) {
+        const float* rowp = lg + (size_t)r * kVocab;
+        int best = 0;
+        float bv = rowp[0];
+        for (int i = 1; i < kVocab; ++i) {
+            if (rowp[i] > bv) { bv = rowp[i]; best = i; }
+        }
+        Slot& sl = slots_[slots[r]];
+        sl.active = true;
+        sl.finished = false;
+        sl.pos = (int)prompts[r].size();
+        sl.pending = best;
+        sl.max_new = std::max(1, max_new[r]);
+        sl.tokens = prompts[r];
+        sl.tokens.push_back(best);
+        sl.generated.clear();
+        sl.generated.push_back(best);
+        if (best == kEosId || sl.max_new <= 1) sl.finished = true;
+    }
+    last_prefill_s_ += std::chrono::duration<double>(
+                           std::chrono::steady_clock::now() - t0).count();
+    last_prefill_tokens_ += T;
+    last_prefill_requests_ += N;
+    if (getenv("MIORI_BATCH_PROFILE"))
+        fprintf(stderr, "add_batch_pass: %d requests, %d tokens packed in %.2f ms\n", N, T,
+                1000.0 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t0)
+                    .count());
+    return true;
+}
+
+std::vector<int> BatchEngine::add_batch(const std::vector<std::vector<int>>& prompts,
+                                        int max_new_tokens) {
+    return add_batch(prompts, std::vector<int>(prompts.size(), std::max(1, max_new_tokens)));
+}
+
+std::vector<int> BatchEngine::add_batch(const std::vector<std::vector<int>>& prompts,
+                                        const std::vector<int>& max_new) {
+    std::vector<int> out(prompts.size(), -1);
+    last_packed_.assign(prompts.size(), 0);
+    last_packed_row_.assign(prompts.size(), -1);
+    if (!ready_) return out;
+    last_prefill_s_ = 0.0;
+    last_prefill_tokens_ = 0;
+    last_prefill_requests_ = 0;
+    size_t i = 0;
+    while (i < prompts.size()) {
+        // Group as many prompts as fit the free slots and the packed row budget.
+        std::vector<int> free_slots;
+        for (int s = 0; s < kBmax && (int)free_slots.size() < (int)prompts.size(); ++s)
+            if (!slots_[s].active) free_slots.push_back(s);
+        if (free_slots.empty()) break;
+        const std::vector<int>& head = prompts[i];
+        if (head.empty() || (int)head.size() > kPackRows || (int)head.size() > kMaxSeq - 1) {
+            // Cannot pack this prompt: fall back to the sequential Engine path.
+            out[i] = add_sequence(head, max_new[i]);
+            ++i;
+            continue;
+        }
+        std::vector<int> idx;
+        int total = 0;
+        while (i < prompts.size() && idx.size() < free_slots.size()) {
+            const std::vector<int>& p = prompts[i];
+            if (p.empty() || (int)p.size() > kPackRows || (int)p.size() > kMaxSeq - 1) break;
+            if (total + (int)p.size() > kPackRows) break;
+            idx.push_back((int)i);
+            total += (int)p.size();
+            ++i;
+        }
+        if (idx.empty()) {   // should not happen; be defensive
+            out[i] = add_sequence(prompts[i], max_new[i]);
+            ++i;
+            continue;
+        }
+        std::vector<int> slots(free_slots.begin(), free_slots.begin() + (long)idx.size());
+        std::vector<std::vector<int>> group;
+        std::vector<int> group_max(idx.size());
+        group.reserve(idx.size());
+        for (size_t k = 0; k < idx.size(); ++k) {
+            group.push_back(prompts[idx[k]]);
+            group_max[k] = max_new[idx[k]];
+        }
+        if (add_batch_pass(group, slots, group_max)) {
+            for (size_t k = 0; k < idx.size(); ++k) {
+                out[idx[k]] = slots[k];
+                last_packed_[(size_t)idx[k]] = 1;
+                last_packed_row_[(size_t)idx[k]] = (int)k;
+                if (plogits_)
+                    memcpy((float*)plogits_->contents() + (size_t)idx[k] * kVocab,
+                           (const float*)logitsb_->contents() + (size_t)k * kVocab,
+                           (size_t)kVocab * 4);
+            }
+        } else {
+            for (size_t k = 0; k < idx.size(); ++k)
+                out[idx[k]] = add_sequence(group[k], group_max[k]);
+        }
+    }
+    return out;
 }
 
 int BatchEngine::decode_step() {

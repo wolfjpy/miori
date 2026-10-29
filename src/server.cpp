@@ -18,6 +18,7 @@
 #include <unordered_map>
 #include <memory>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
@@ -209,25 +210,69 @@ public:
                 }
             }
             // Fill free slots from the queue.
-            for (;;) {
-                std::shared_ptr<Job> j;
+            //
+            // MIORI_BATCH_PREFILL=1 packs the queued prompts into one batched
+            // prefill pass (BatchEngine::add_batch) instead of prefilling them
+            // one at a time through the shared Engine. The default server
+            // behaviour is unchanged.
+            static const bool batch_prefill = [] {
+                const char* v = getenv("MIORI_BATCH_PREFILL");
+                return v && atoi(v) != 0;
+            }();
+            if (batch_prefill) {
+                std::vector<std::shared_ptr<Job>> jobs;
                 {
                     std::lock_guard<std::mutex> lk(mu_);
-                    if (q_.empty()) break;
-                    j = q_.front();
+                    const size_t free_n = (size_t)BatchEngine::kBmax - active.size();
+                    while (!q_.empty() && jobs.size() < free_n)
+                        { jobs.push_back(q_.front()); q_.pop_front(); }
                 }
-                int s = -1;
-                {
-                    std::lock_guard<std::mutex> el(eng_mu_);
-                    s = be_.add_sequence(j->prompt, j->max_tokens);
+                if (!jobs.empty()) {
+                    std::vector<std::vector<int>> prompts(jobs.size());
+                    std::vector<int> max_new(jobs.size());
+                    for (size_t k = 0; k < jobs.size(); ++k) {
+                        prompts[k] = jobs[k]->prompt;
+                        max_new[k] = jobs[k]->max_tokens;
+                    }
+                    std::vector<int> slots;
+                    {
+                        std::lock_guard<std::mutex> el(eng_mu_);
+                        slots = be_.add_batch(prompts, max_new);
+                    }
+                    for (size_t k = 0; k < jobs.size(); ++k) {
+                        if (slots[k] >= 0) {
+                            active[slots[k]] = jobs[k];
+                            active_cnt_.fetch_add(1);
+                        } else {
+                            // Unpackable request (e.g. too long): fail it closed;
+                            // the handler falls back to the single-sequence path.
+                            std::lock_guard<std::mutex> jl(jobs[k]->m);
+                            jobs[k]->done = true;
+                            jobs[k]->cv.notify_all();
+                        }
+                    }
                 }
-                if (s < 0) break;
-                {
-                    std::lock_guard<std::mutex> lk(mu_);
-                    if (!q_.empty() && q_.front() == j) q_.pop_front();
+            } else {
+                for (;;) {
+                    std::shared_ptr<Job> j;
+                    {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        if (q_.empty()) break;
+                        j = q_.front();
+                    }
+                    int s = -1;
+                    {
+                        std::lock_guard<std::mutex> el(eng_mu_);
+                        s = be_.add_sequence(j->prompt, j->max_tokens);
+                    }
+                    if (s < 0) break;
+                    {
+                        std::lock_guard<std::mutex> lk(mu_);
+                        if (!q_.empty() && q_.front() == j) q_.pop_front();
+                    }
+                    active[s] = j;
+                    active_cnt_.fetch_add(1);
                 }
-                active[s] = j;
-                active_cnt_.fetch_add(1);
             }
             if (active.empty()) {
                 // Unserviceable request (e.g. prompt too long): drop it instead of spinning.

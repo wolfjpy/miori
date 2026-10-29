@@ -231,3 +231,41 @@ kernel void gemv8_b(device const uint4* q [[buffer(0)]],
         if (lane == 0u) y[(ulong)r * N + row] = v;
     }
 }
+
+// ---------------------------------------------------------------- packed prefill
+// The kernels below implement packed multi-request prefill (BatchEngine::add_batch):
+// several prompts are concatenated into one [T][...] activation buffer, so the
+// 24 layers' GEMMs run once for all requests. Only the request-boundary work
+// (KV writes, attention, conv state) stays per request.
+
+// KV write for a packed [T][512] chunk. Row r belongs to request slot slots[r]
+// and sits at position positions[r] (both restart at 0 for every request).
+kernel void kv_write_packed(device const bfloat* k [[buffer(0)]],
+                            device const float* v [[buffer(1)]],
+                            device bfloat* kc [[buffer(2)]],
+                            device bfloat* vc [[buffer(3)]],
+                            device const uint* slots [[buffer(4)]],
+                            device const uint* positions [[buffer(5)]],
+                            constant uint& max_seq [[buffer(6)]],
+                            constant uint& kvh [[buffer(7)]],
+                            uint i [[thread_position_in_grid]]) {
+    const uint row = i / 512u, r = i % 512u;
+    const uint h = r / 128u, d = r % 128u;
+    const uint slot = slots[row], pos = positions[row];
+    kc[(((ulong)slot * kvh + h) * max_seq + pos) * 128ul + d] = k[(ulong)row * 512ul + r];
+    vc[(((ulong)slot * kvh + h) * 128ul + d) * max_seq + pos] =
+        bfloat(v[(ulong)row * 512ul + r]);
+}
+
+// Gather the last row of every packed request out of a [T][K] bf16 buffer:
+// dst[r][i] = src[rows[r]][i]. One threadgroup per request.
+kernel void gather_rows(device const bfloat* src [[buffer(0)]],
+                        device bfloat* dst [[buffer(1)]],
+                        device const uint* rows [[buffer(2)]],
+                        constant uint& K [[buffer(3)]],
+                        uint tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]]) {
+    device const bfloat* s = src + (ulong)rows[tg] * K;
+    device bfloat* d = dst + (ulong)tg * K;
+    for (uint i = tid; i < K; i += 256u) d[i] = s[i];
+}

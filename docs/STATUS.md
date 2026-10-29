@@ -1,7 +1,5 @@
-| C2 | PARTIAL: hybrid 1/B=32 server; no paged KV/batched prefill || Vision feature cache | working (32-entry LRU) | `C4` |
-| Ragged vision batch / queue | **not implemented** | `C4` || Multi-image request | working, sequential vision per image |
-| Ragged vision batch / queue / feature cache | **not implemented** || Multi-image request | working (sequential vision per image) | `C4` |
-| Ragged vision batch / queue / feature cache | **not implemented** | `C4` || C2 | PARTIAL: Bmax=4 continuous-admission batch server; no paged KV/batched prefill |# STATUS — 2026-10-29
+# STATUS — 2026-10-29
+- C2: PARTIAL — packed multi-request prefill landed (64 x 23-token prompts 2.10 s -> 0.67 s, bit-identical); still no paged KV or continuous batching.
 
 ## Delivered and measured
 
@@ -20,14 +18,17 @@
 | Multi-image batch / vision queue | **not implemented** | `C4` |
 | Paged KV / int8 KV | **not implemented** | `C2`, `C5` |
 | Single-prefix KV cache | working in CLI and HTTP (one system slot) | `C5` |
-| Fixed-slot batch decode (Bmax=4) | working, CLI `batch-test` only | `C2` |
+| Fixed-slot batch decode (Bmax=32) | working, server-integrated (hybrid 1 / B=32) | `C2` |
+| Packed multi-request prefill | working: 64 x 23-token prompts 2.10 s -> 0.67 s (3.13x), first-token logits / KV / conv state bit-identical | `C2` |
 
 ## Milestone verdicts
 
 - M0 C0: GO with exceptions (ICB not attempted).
 - M1 C1: GO with exceptions (97.5 vs 100 tok/s; full CPU top-1 matrix not run).
-- M2 C2: PARTIAL (fixed-slot batch decode up to 4 sequences, token-identical on
-  the batched 4-bit GEMV path; no paged KV, continuous batching or server wiring).
+- M2 C2: PARTIAL — fixed-slot batch decode (Bmax=32) is server-integrated and
+  packed multi-request prefill now makes 64 short prompts 3.1x faster
+  (2.10 s -> 0.67 s) with bit-identical first-token logits, KV and conv state;
+  paged KV and continuous (chunked) batching are still missing.
 - M3 C3: PARTIAL (API works; 64-concurrency gate not met).
 - M4 C4: GO — captions end to end (CPU cosine 0.9997), 512² 32 ms warm vs the
   40 ms gate, 1024² 271 ms vs 600 ms. Not wired into the HTTP API and no
@@ -45,8 +46,10 @@ batching; vision tower) rather than tuning work, and were not started.
 
 ## Next (in order)
 
-1. Paged KV + ragged continuous batching on top of `BatchEngine` (C2) — unlocks
-   the 高并发 targets; fixed-slot decode already works.
+1. Paged KV + ragged continuous batching on top of `BatchEngine` (C2): merge
+   prefill and decode in one step (a packed prefill pass currently blocks the
+   batch), pack more than 32 requests / 1024-token prompts per pass, and lift the
+   4-bit batched GEMV path back to a usable B ≤ 4 mode.
 2. Vision in the serving path: image_url/base64 input, vision queue, MPP bf16
    GEMM for the tower (C4 latency), multi-image ragged batch.
 3. int8 KV, prefix cache, shared-prefix attention (C5).

@@ -15,8 +15,8 @@ No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ 
 | Prefill (MPP tensor-core GEMM, bf16 weight cache) | working, ~2.7K tok/s @1K |
 | Decode (4-bit GEMV) | working, ~97 tok/s |
 | OpenAI-compatible HTTP + SSE | working, serialized |
-| Batch decode (fixed slots, Bmax=4) | working, CLI only |
-| Batch decode (Bmax=4) | working, server-integrated |
+| Batch decode (fixed slots) | working, Bmax=32, server-integrated |
+| Packed multi-request prefill (`add_batch`) | working: 64 × 23-token prompts 2.10 s → 0.67 s (3.1×), bit-identical |
 | Vision tower (patchifier, 14 layers, projector) | working: `vision-run` captions photos |
 | Vision on MPP tensor cores (bf16 tile-major cache) | working: 8.2× faster than the SIMT path |
 | Vision in the HTTP API | working, one base64 image per request |
@@ -100,15 +100,19 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ./build/miori bench --prefill 1024 --decode 128
 ./build/miori batch-test --prompts "The capital of France is" "List the first four primes."
 ./build/miori batch-test --kernels gemv4 --prompts "..." "..."   # batched 4-bit GEMV path
+./build/miori test-mpp-tile          # 32- vs 64-row MPP tile numerics (bit-identical)
+./build/miori batch-prefill-test     # 64 packed prompts vs sequential prefill: timing + logits/KV diff
+./build/miori batch-prefill-test --n 64 --repeat 3 --state-check 4 --long 423 [--words]
 ```
 
 ## Known limitations
 
 - The HTTP server serializes requests behind a mutex; the 64×2K / 64×4K
   concurrency targets from `docs/MILESTONES.md` are not met.
-- Batch decode exists only in the CLI test (`batch-test`) with Bmax=4 fixed
-  slots, sequential prefill and contiguous per-slot KV; no paged KV, no
-  continuous batching. See `docs/checkpoints/C2-batching.md`.
+- Fixed-slot batch (Bmax=32) with contiguous per-slot KV; no paged KV and no
+  continuous batching. Packed prefill covers up to 32 requests / 1024 tokens per
+  pass (`MIORI_BATCH_PREFILL=1` in the server, off by default); longer prompts
+  fall back to the sequential prefill. See `docs/checkpoints/C2-batching.md`.
 - No paged KV, no prefix cache, no int8 KV.
 - Vision works from the CLI only (`vision-run`, `vision-test`); the HTTP API has
   no image input yet, there is no multi-image batch and no vision feature cache.
@@ -119,7 +123,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 - The vision tower needs a 378 MB bf16 tile-major weight cache in addition to the
   1.59 GB safetensors mapping and the 2.93 GB text bf16 cache.
 - Prefill chunks are 128 tokens; the bf16 cache costs 2.93 GB of the 12.7 GB
-  working set.
+  working set, and the packed-prefill activations another 175 MB.
 - Greedy decoding is exact; temperature/top-k/top-p are implemented on the CPU.
 
 ## Docs
@@ -135,12 +139,24 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ./build/miori bench --prefill 1024 --decode 128
 ./build/miori batch-test --prompts "The capital of France is" "List the first four primes."
 ./build/miori batch-test --kernels gemv4 --prompts "..." "..."   # batched 4-bit GEMV path
+./build/miori batch-prefill-test --n 64 --repeat 5 --state-check 4 --long 423
 ```
 
 Reported on the target M6: prefill 2542 tok/s, decode 94.1 tok/s at 1K context
 (97.5 tok/s at short context), ~114 GB/s effective.
 
 4K context: prefill 1663.7 tok/s, decode 92.2 tok/s.
+
+Packed multi-request prefill, 64 x 23-token prompts (2 passes of 32, median of 5):
+
+```
+sequential Engine::prefill_ids : 2.095 s =  708 tok/s (32.7 ms/request)
+packed BatchEngine::add_batch  : 0.669 s = 2218 tok/s (10.5 ms/request)   3.13x
+first tokens 64/64 identical, first-token logits 0/8192000 differ, KV+conv state byte-identical
+```
+
+64 concurrent HTTP requests (23-token prompts, greedy, 16 max_tokens):
+2.94 s -> 1.51 s with `MIORI_BATCH_PREFILL=1`, identical response bodies.
 
 ## Metrics
 

@@ -552,6 +552,71 @@ void gemv8_b(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
                             MTL::Size::Make(512, 1, 1));
 }
 
+void gemv8_b_off(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
+                 const Tensor& q, const Tensor& s, const Tensor& b, MTL::Buffer* x,
+                 MTL::Buffer* y, uint32_t N, uint32_t K, uint32_t B, uint32_t xoff,
+                 uint32_t yoff) {
+    auto p = m.pso("gemv8_b");
+    e->setComputePipelineState(p);
+    e->setBuffer(w.buffer(), q.begin, 0);
+    e->setBuffer(w.buffer(), s.begin, 1);
+    e->setBuffer(w.buffer(), b.begin, 2);
+    e->setBuffer(x, xoff, 3);
+    e->setBuffer(y, yoff, 4);
+    e->setBytes(&N, sizeof(N), 5);
+    e->setBytes(&K, sizeof(K), 6);
+    e->setBytes(&B, sizeof(B), 7);
+    e->dispatchThreadgroups(MTL::Size::Make((N + 15) / 16, 1, 1),
+                            MTL::Size::Make(512, 1, 1));
+}
+
+void kv_write_packed(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                     MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                     MTL::Buffer* slots, MTL::Buffer* positions, uint32_t T,
+                     uint32_t max_seq, uint32_t kvh) {
+    auto p = m.pso("kv_write_packed");
+    e->setComputePipelineState(p);
+    e->setBuffer(k, 0, 0);
+    e->setBuffer(v, 0, 1);
+    e->setBuffer(kc, 0, 2);
+    e->setBuffer(vc, 0, 3);
+    e->setBuffer(slots, 0, 4);
+    e->setBuffer(positions, 0, 5);
+    e->setBytes(&max_seq, sizeof(max_seq), 6);
+    e->setBytes(&kvh, sizeof(kvh), 7);
+    uint64_t total = (uint64_t)T * 512u;
+    e->dispatchThreads(MTL::Size::Make(total, 1, 1), MTL::Size::Make(256, 1, 1));
+}
+
+void conv7_off(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* gated,
+               uint32_t goff, MTL::Buffer* bcx, uint32_t boff, const Weights& w,
+               const Tensor& kernel, MTL::Buffer* state, MTL::Buffer* state_out,
+               uint32_t sooff, MTL::Buffer* y, uint32_t yoff, uint32_t T, uint32_t H) {
+    auto p = m.pso("conv7");
+    e->setComputePipelineState(p);
+    e->setBuffer(gated, goff, 0);
+    e->setBuffer(bcx, boff, 1);
+    e->setBuffer(w.buffer(), kernel.begin, 2);
+    e->setBuffer(state, 0, 3);
+    e->setBuffer(state_out, sooff, 4);
+    e->setBuffer(y, yoff, 5);
+    e->setBytes(&T, sizeof(T), 6);
+    e->setBytes(&H, sizeof(H), 7);
+    uint64_t total = (uint64_t)T * H;
+    e->dispatchThreads(MTL::Size::Make(total, 1, 1), MTL::Size::Make(256, 1, 1));
+}
+
+void gather_rows(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* src,
+                 MTL::Buffer* dst, MTL::Buffer* rows, uint32_t N, uint32_t K) {
+    auto p = m.pso("gather_rows");
+    e->setComputePipelineState(p);
+    e->setBuffer(src, 0, 0);
+    e->setBuffer(dst, 0, 1);
+    e->setBuffer(rows, 0, 2);
+    e->setBytes(&K, sizeof(K), 3);
+    e->dispatchThreadgroups(MTL::Size::Make(N, 1, 1), MTL::Size::Make(256, 1, 1));
+}
+
 void dequant8(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
               const Tensor& q, const Tensor& s, const Tensor& b,
               MTL::Buffer* out, uint32_t N, uint32_t K) {
@@ -582,3 +647,4 @@ void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
 }
 
 }  // namespace miori
+

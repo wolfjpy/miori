@@ -27,6 +27,20 @@ static void fill_bf16(MTL::Buffer* b, size_t n, float (*fn)(size_t)) {
 
 static float xfn(size_t k) { return ((float)((k * 37) % 101) - 50.0f) / 50.0f; }
 
+// Number of differing bytes in two host-visible buffers (packed prefill checks).
+static size_t diff_bytes(const void* a, const void* b, size_t n) {
+    const uint8_t* pa = (const uint8_t*)a;
+    const uint8_t* pb = (const uint8_t*)b;
+    size_t d = 0;
+    for (size_t i = 0; i < n; ++i) d += (pa[i] != pb[i]) ? 1 : 0;
+    return d;
+}
+
+static double median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v[v.size() / 2];
+}
+
 static void test_gemv(Metal& m, Weights& w, bool eight, bool four = false) {
     const Tensor& q = eight ? w.get("language_model.model.embed_tokens.weight")
                             : w.get("language_model.model.layers.2.self_attn.q_proj.weight");
@@ -802,6 +816,331 @@ int main(int argc, char** argv) {
         printf("prefill: %.3f s  %.1f tok/s\n", p, ids.size() / p);
         printf("decode:  %.3f s  %.1f tok/s  (%.1f GB/s effective)\n",
                d, dlen / d, 1.212e9 * (dlen / d) / 1e9);
+    } else if (cmd == "test-mpp-tile") {
+        // Does the tensor-core GEMM result per row depend on the M tile shape?
+        // The sequential prefill uses gemm_mpp32 for T <= 32, the packed prefill
+        // uses the 64-row gemm_mpp, so this gates bit-exactness of the two paths.
+        Engine e(m, w);
+        if (!e.init(err)) { fprintf(stderr, "engine: %s\n", err.c_str()); return 1; }
+        const Tensor& qw = w.get("language_model.model.layers.0.conv.in_proj.weight");
+        const uint32_t N = (uint32_t)qw.rows(), K = (uint32_t)(qw.cols() * 8);
+        const uint32_t off = e.weight_offset(qw);
+        const uint32_t M = 23, rows = 64;
+        MTL::Buffer* A = m.new_buffer((size_t)rows * K * 2);
+        MTL::Buffer* C32 = m.new_buffer((size_t)rows * N * 4);
+        MTL::Buffer* C64 = m.new_buffer((size_t)rows * N * 4);
+        MTL::Buffer* C64b = m.new_buffer((size_t)rows * N * 4);
+        fill_bf16(A, (size_t)rows * K, xfn);
+        {
+            auto cb = m.begin();
+            auto enc = cb->computeCommandEncoder();
+            gemm_mpp32(m, enc, A, e.bf16_buffer(), C32, M, N, K, off);
+            gemm_mpp(m, enc, A, e.bf16_buffer(), C64, M, N, K, off);
+            gemm_mpp(m, enc, A, e.bf16_buffer(), C64b, rows, N, K, off);
+            enc->endEncoding();
+            m.submit(cb, true);
+        }
+        const float* p32 = (const float*)C32->contents();
+        const float* p64 = (const float*)C64->contents();
+        const float* p64b = (const float*)C64b->contents();
+        auto cmp = [&](const float* a, const float* b, const char* label) {
+            double mx = 0.0;
+            size_t ndiff = 0;
+            for (uint32_t r = 0; r < M; ++r)
+                for (uint32_t c = 0; c < N; ++c) {
+                    const float d = fabsf(a[(size_t)r * N + c] - b[(size_t)r * N + c]);
+                    if (d != 0.0f) ++ndiff;
+                    if (d > mx) mx = d;
+                }
+            printf("%-42s %zu/%zu differ, max abs diff %.6g\n", label, ndiff, (size_t)M * N, mx);
+        };
+        printf("test-mpp-tile: N=%u K=%u, rows 0..%u of 64\n", N, K, M - 1);
+        cmp(p32, p64, "gemm_mpp32(M=23) vs gemm_mpp(M=23)");
+        cmp(p64, p64b, "gemm_mpp(M=23) vs gemm_mpp(M=64)");
+    } else if (cmd == "batch-prefill-test") {
+        // Packed multi-request prefill vs the sequential Engine path.
+        Tokenizer t;
+        if (!t.load("models/tokenizer.json", err)) {
+            fprintf(stderr, "tokenizer: %s\n", err.c_str());
+            return 1;
+        }
+        int nreq = 64, reps = 3, state_check = 4, long_target = 423;
+        bool words = false;
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--n" && i + 1 < argc) nreq = atoi(argv[++i]);
+            else if (a == "--repeat" && i + 1 < argc) reps = atoi(argv[++i]);
+            else if (a == "--state-check" && i + 1 < argc) state_check = atoi(argv[++i]);
+            else if (a == "--long" && i + 1 < argc) long_target = atoi(argv[++i]);
+            else if (a == "--words") words = true;
+        }
+        if (nreq < 1) nreq = 1;
+        if (reps < 1) reps = 1;
+        // Keep every packed request's first-token logits stable across passes so
+        // they can be diffed against the sequential reference below.
+        setenv("MIORI_BATCH_KEEP_LOGITS", "1", 1);
+
+        Engine e(m, w);
+        if (!e.init(err)) { fprintf(stderr, "engine: %s\n", err.c_str()); return 1; }
+        BatchEngine be(m, w, e);
+        if (!be.init(err)) { fprintf(stderr, "batch: %s\n", err.c_str()); return 1; }
+
+        const std::string sys = "You are a helpful assistant.";
+        // Default: single-word user turns, i.e. ~23-token prompts through the LFM3
+        // chat template (the 64-concurrent server scenario). --words uses longer
+        // (~29-token) question prompts instead.
+        static const char* kWords[] = {"Hi",     "OK",   "Yes",  "No",   "Hey",  "Hello",
+                                       "Thanks", "Sure", "Go",   "Stop", "Blue", "Red",
+                                       "Cat",    "Dog",  "Sun",  "Moon", "Fast", "Slow",
+                                       "One",    "Two",  "Nice", "Cool", "Wow",  "True"};
+        const char* qs[4] = {"What is %d plus %d?", "Name color number %d.",
+                             "Say hello to friend %d.", "What is %d times 2?"};
+        std::vector<std::vector<int>> ids(nreq);
+        size_t minlen = (size_t)-1, maxlen = 0, sumlen = 0;
+        for (int i = 0; i < nreq; ++i) {
+            if (words) {
+                char buf[96];
+                snprintf(buf, sizeof buf, qs[i % 4], i + 1, i + 2);
+                ids[i] = t.chat(sys, buf, false);
+            } else {
+                ids[i] = t.chat(sys, kWords[i % (int)(sizeof(kWords) / sizeof(kWords[0]))],
+                                false);
+            }
+            minlen = std::min(minlen, ids[i].size());
+            maxlen = std::max(maxlen, ids[i].size());
+            sumlen += ids[i].size();
+        }
+
+        GenConfig cfg;
+        cfg.max_tokens = 1;
+        cfg.temperature = 0.0f;
+        const int waves = (nreq + BatchEngine::kBmax - 1) / BatchEngine::kBmax;
+
+        // Warm up both paths (pipeline compilation / first-touch).
+        {
+            be.clear_slots();
+            std::vector<std::vector<int>> warm(ids.begin(),
+                                               ids.begin() + std::min<size_t>(4, ids.size()));
+            be.add_batch(warm, 1);
+            e.reset();
+            e.prefill_ids(ids[0], true);
+            e.sample(cfg);
+        }
+
+        std::vector<int> ref_first(nreq), pack_first(nreq, -1);
+        std::vector<float> ref_logits((size_t)nreq * BatchEngine::kVocab);
+        std::vector<float> pack_logits((size_t)nreq * BatchEngine::kVocab);
+        std::vector<double> ref_time(reps), pack_time(reps);
+
+        for (int rep = 0; rep < reps; ++rep) {
+            const bool capture = (rep == 0);
+            auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < nreq; ++i) {
+                e.reset();
+                e.prefill_ids(ids[i], true);
+                ref_first[i] = e.sample(cfg);
+                if (capture)
+                    memcpy(&ref_logits[(size_t)i * BatchEngine::kVocab], e.logits(),
+                           (size_t)BatchEngine::kVocab * 4);
+            }
+            ref_time[rep] = std::chrono::duration<double>(
+                                std::chrono::steady_clock::now() - t0).count();
+
+            double ps = 0.0;
+            for (int w = 0; w < waves; ++w) {
+                const int lo = w * BatchEngine::kBmax;
+                const int hi = std::min(nreq, lo + BatchEngine::kBmax);
+                std::vector<std::vector<int>> group(ids.begin() + lo, ids.begin() + hi);
+                be.clear_slots();
+                auto slots = be.add_batch(group, 1);
+                ps += be.last_prefill_s();
+                for (int k = 0; k < hi - lo; ++k) {
+                    const int i = lo + k;
+                    if (slots[k] >= 0 && !be.generated(slots[k]).empty())
+                        pack_first[i] = be.generated(slots[k])[0];
+                    if (capture && be.packed_logits(k))
+                        memcpy(&pack_logits[(size_t)i * BatchEngine::kVocab],
+                               be.packed_logits(k), (size_t)BatchEngine::kVocab * 4);
+                }
+            }
+            pack_time[rep] = ps;
+        }
+
+        int idmatch = 0;
+        int first_bad = -1;
+        double maxdiff = 0.0;
+        size_t logit_ndiff = 0;
+        for (int i = 0; i < nreq; ++i) {
+            if (pack_first[i] == ref_first[i]) ++idmatch;
+            else if (first_bad < 0) first_bad = i;
+            for (int v = 0; v < BatchEngine::kVocab; ++v) {
+                const float d = fabsf(pack_logits[(size_t)i * BatchEngine::kVocab + v] -
+                                      ref_logits[(size_t)i * BatchEngine::kVocab + v]);
+                if (d != 0.0f) ++logit_ndiff;
+                if (d > maxdiff) maxdiff = d;
+            }
+        }
+
+        const double ref_med = median(ref_time), pack_med = median(pack_time);
+        printf("\nbatch-prefill-test: %d prompts, %zu..%zu tokens (mean %.1f, total %zu), "
+               "%d wave(s) of <= %d, %d repetition(s)\n",
+               nreq, minlen, maxlen, (double)sumlen / nreq, sumlen, waves, BatchEngine::kBmax,
+               reps);
+        printf("sequential Engine::prefill_ids : %.3f s median (min %.3f max %.3f) = %.0f tok/s\n",
+               ref_med, *std::min_element(ref_time.begin(), ref_time.end()),
+               *std::max_element(ref_time.begin(), ref_time.end()), sumlen / ref_med);
+        printf("packed BatchEngine::add_batch  : %.3f s median (min %.3f max %.3f) = %.0f tok/s\n",
+               pack_med, *std::min_element(pack_time.begin(), pack_time.end()),
+               *std::max_element(pack_time.begin(), pack_time.end()), sumlen / pack_med);
+        printf("prefill speedup: %.2fx (%.2f -> %.2f ms per request)\n", ref_med / pack_med,
+               1000.0 * ref_med / nreq, 1000.0 * pack_med / nreq);
+        printf("first tokens: %d/%d identical%s\n", idmatch, nreq,
+               first_bad >= 0 ? " (first mismatch at prompt index shown below)" : "");
+        if (first_bad >= 0)
+            printf("  first mismatch: prompt %d, ref=%d packed=%d\n", first_bad,
+                   ref_first[first_bad], pack_first[first_bad]);
+        printf("first-token logits: %zu/%zu elements differ, max |diff| = %.6g\n", logit_ndiff,
+               (size_t)nreq * BatchEngine::kVocab, maxdiff);
+
+        // ---- byte-exact state check: KV cache and conv state of the slots must
+        // match what the sequential Engine leaves behind for the same prompt.
+        auto state_cmp = [&](const std::vector<std::vector<int>>& group,
+                             const std::vector<int>& slots, const char* tag) {
+            int ok = 0;
+            for (size_t i = 0; i < group.size(); ++i) {
+                e.reset();
+                e.prefill_ids(group[i], false);
+                const int pos = e.pos();
+                const int slot = slots[i];
+                size_t kv_bad = 0, kv_bytes = 0, cs_bad = 0, cs_bytes = 0;
+                for (int l = 0; l < BatchEngine::kLayers; ++l) {
+                    if (Engine::is_attention_layer(l)) {
+                        const uint8_t* ek = (const uint8_t*)e.kv_k(l)->contents();
+                        const uint8_t* ev = (const uint8_t*)e.kv_v(l)->contents();
+                        const uint8_t* sk = (const uint8_t*)be.slot_kv_k(l)->contents();
+                        const uint8_t* sv = (const uint8_t*)be.slot_kv_v(l)->contents();
+                        const size_t kb = (size_t)pos * BatchEngine::kHeadDim * 2;
+                        for (int h = 0; h < BatchEngine::kKvHeads; ++h) {
+                            const size_t ebase =
+                                (size_t)h * BatchEngine::kMaxSeq * BatchEngine::kHeadDim * 2;
+                            const size_t sbase = ((size_t)slot * BatchEngine::kKvHeads + h) *
+                                                 BatchEngine::kMaxSeq * BatchEngine::kHeadDim * 2;
+                            kv_bad += diff_bytes(ek + ebase, sk + sbase, kb);
+                            kv_bytes += kb;
+                            const size_t ebase_v =
+                                (size_t)h * BatchEngine::kHeadDim * BatchEngine::kMaxSeq * 2;
+                            const size_t sbase_v = ((size_t)slot * BatchEngine::kKvHeads + h) *
+                                                   BatchEngine::kHeadDim * BatchEngine::kMaxSeq * 2;
+                            for (int d = 0; d < BatchEngine::kHeadDim; ++d) {
+                                const size_t eo = ebase_v + (size_t)d * BatchEngine::kMaxSeq * 2;
+                                const size_t so = sbase_v + (size_t)d * BatchEngine::kMaxSeq * 2;
+                                const size_t n = (size_t)pos * 2;
+                                kv_bad += diff_bytes(ev + eo, sv + so, n);
+                                kv_bytes += n;
+                            }
+                        }
+                    } else {
+                        const uint8_t* ec = (const uint8_t*)e.conv_state(l)->contents();
+                        const uint8_t* sc =
+                            (const uint8_t*)be.slot_conv_state(l)->contents() +
+                            ((size_t)slot * 2 + (size_t)be.conv_state_cur(l)) *
+                                BatchEngine::kConvState * 4;
+                        const size_t n = (size_t)BatchEngine::kConvState * 4;
+                        cs_bad += diff_bytes(ec, sc, n);
+                        cs_bytes += n;
+                    }
+                }
+                printf("%s prompt %zu: %zu tokens, KV %zu/%zu bytes differ, conv %zu/%zu bytes "
+                       "differ\n",
+                       tag, i, group[i].size(), kv_bad, kv_bytes, cs_bad, cs_bytes);
+                if (kv_bad == 0 && cs_bad == 0) ++ok;
+            }
+            return ok;
+        };
+
+        int state_ok = 0, state_total = 0;
+        if (state_check > 0) {
+            const int nc = std::min(state_check, nreq);
+            std::vector<std::vector<int>> group(ids.begin(), ids.begin() + nc);
+            be.clear_slots();
+            auto slots = be.add_batch(group, 1);
+            printf("\nstate check (packed KV/conv state vs sequential Engine):\n");
+            state_ok += state_cmp(group, slots, "short");
+            state_total += nc;
+        }
+
+        // ---- one long prompt (~423 tokens, several 128-token chunks), packed
+        // together with a short prompt to exercise different request lengths.
+        if (long_target > 0) {
+            const std::string sentence =
+                "This paragraph exists only to make the prompt long enough to span several "
+                "prefill chunks. ";
+            std::vector<int> long_ids;
+            std::string text;
+            do {
+                text += sentence;
+                long_ids = t.chat(sys, text, false);
+            } while ((int)long_ids.size() < long_target);
+            std::vector<std::vector<int>> group = {long_ids, ids[0]};
+
+            e.reset();
+            e.prefill_ids(group[0], true);
+            const int ref_first_long = e.sample(cfg);
+            std::vector<float> ref_logits_long(e.logits(), e.logits() + BatchEngine::kVocab);
+            e.reset();
+            e.prefill_ids(group[1], true);
+            const int ref_first_short = e.sample(cfg);
+            std::vector<float> ref_logits_short(e.logits(), e.logits() + BatchEngine::kVocab);
+
+            be.clear_slots();
+            auto slots = be.add_batch(group, 1);
+            const double long_s = be.last_prefill_s();
+            int long_ok = 0;
+            int long_compared = 0;
+            double long_max = 0.0;
+            size_t long_ndiff = 0;
+            for (int k = 0; k < 2; ++k) {
+                const int pf = slots[k] >= 0 && !be.generated(slots[k]).empty()
+                                   ? be.generated(slots[k])[0]
+                                   : -1;
+                const std::vector<float>& rl = k == 0 ? ref_logits_long : ref_logits_short;
+                const int rf = k == 0 ? ref_first_long : ref_first_short;
+                if (pf == rf) ++long_ok;
+                if (!be.was_packed(k)) {
+                    printf("  request %d (%zu tokens) used the sequential fallback "
+                           "(prompt > kPackRows=%d); logits comparison skipped\n",
+                           k, group[k].size(), BatchEngine::kPackRows);
+                    continue;
+                }
+                ++long_compared;
+                for (int v = 0; v < BatchEngine::kVocab; ++v) {
+                    const float d = fabsf(be.packed_logits(k)[v] - rl[v]);
+                    if (d != 0.0f) ++long_ndiff;
+                    if (d > long_max) long_max = d;
+                }
+            }
+            printf("\nlong prompt: %zu tokens + %zu-token prompt in one add_batch call: %.1f ms\n",
+                   group[0].size(), group[1].size(), 1000.0 * long_s);
+            printf("  first tokens: %d/2 identical, logits %zu/%zu differ (%d packed request(s)), "
+                   "max |diff| %.6g\n",
+                   long_ok, long_ndiff, (size_t)long_compared * BatchEngine::kVocab,
+                   long_compared, long_max);
+            printf("  state check:\n");
+            state_ok += state_cmp(group, slots, "long+short");
+            state_total += 2;
+        }
+
+        printf("\nstate check: %d/%d requests byte-identical (KV + conv state)\n", state_ok,
+               state_total);
+        const bool all_ok = idmatch == nreq && state_ok == state_total && logit_ndiff == 0;
+        if (all_ok)
+            printf("RESULT: packed prefill is bit-identical to the sequential path "
+                   "(first-token logits, KV, conv state) and %.2fx faster\n",
+                   ref_med / pack_med);
+        else
+            printf("RESULT: packed prefill differs from the sequential path "
+                   "(ids %d/%d, logits %zu differ, state %d/%d); see above\n",
+                   idmatch, nreq, logit_ndiff, state_ok, state_total);
     } else if (cmd == "batch-test") {
         Tokenizer t;
         if (!t.load("models/tokenizer.json", err)) {

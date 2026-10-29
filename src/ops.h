@@ -168,6 +168,36 @@ void gemv8_b(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
              const Tensor& q, const Tensor& s, const Tensor& b, MTL::Buffer* x,
              MTL::Buffer* y, uint32_t N, uint32_t K, uint32_t B);
 
+// Same kernel with byte offsets into x ([B][K] bf16) and y ([B][N] f32). The
+// kernel always computes 4 rows, so B must be 4 and both buffers must hold
+// 4 rows from the offset.
+void gemv8_b_off(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
+                 const Tensor& q, const Tensor& s, const Tensor& b, MTL::Buffer* x,
+                 MTL::Buffer* y, uint32_t N, uint32_t K, uint32_t B, uint32_t xoff,
+                 uint32_t yoff);
+
+// ---- packed multi-request prefill ------------------------------------------
+
+// Write a packed [T][512] K (bf16, post-RoPE) / V (f32) chunk into per-request
+// KV slots. slots[r] / positions[r] give the destination slot and position of
+// packed row r. Byte-identical to the single-sequence kv_write_b layout.
+void kv_write_packed(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                     MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                     MTL::Buffer* slots, MTL::Buffer* positions, uint32_t T,
+                     uint32_t max_seq, uint32_t kvh);
+
+// conv7 for one request of a packed batch, with byte offsets into gated [T][H],
+// bcx [T][3H], y [T][H] and state_out [6][H]. `state` is the 6-token window
+// entering the request (zero for a fresh prompt).
+void conv7_off(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* gated,
+               uint32_t goff, MTL::Buffer* bcx, uint32_t boff, const Weights& w,
+               const Tensor& kernel, MTL::Buffer* state, MTL::Buffer* state_out,
+               uint32_t sooff, MTL::Buffer* y, uint32_t yoff, uint32_t T, uint32_t H);
+
+// dst[r][i] = src[rows[r]][i] over bf16 [N][K] rows (last-token gather).
+void gather_rows(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* src,
+                 MTL::Buffer* dst, MTL::Buffer* rows, uint32_t N, uint32_t K);
+
 void dequant8(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
               const Tensor& q, const Tensor& s, const Tensor& b,
               MTL::Buffer* out, uint32_t N, uint32_t K);
