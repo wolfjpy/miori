@@ -3,34 +3,39 @@
 Metal + C++20 inference engine for `LiquidAI/LFM3-VL-2B-MLX-4bit` on Apple M6 / 16 GB.
 No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ host.
 
-## Status (v0.1.0-core)
+## Status (v0.3.1)
 
 | Area | State |
 |---|---|
 | Text model (24 layers, 4-bit + 8-bit embed) | working |
 | Tokenizer (128K BPE) + LFM3 chat template | working |
-| Prefill (MPP tensor-core GEMM, bf16 weight cache) | working, ~2.7K tok/s @1K |
-| Decode (4-bit GEMV) | working, ~97 tok/s |
-| OpenAI-compatible HTTP + SSE | working, serialized |
-| Batch decode (fixed slots) | working, Bmax=32, server-integrated |
-| Packed multi-request prefill (`add_batch`) | working: 64 × 23-token prompts 2.10 s → 0.67 s (3.1×), bit-identical |
-| Vision tower (patchifier, 14 layers, projector) | working: `vision-run` captions photos |
-| Vision on MPP tensor cores (bf16 tile-major cache) | working: 8.2× faster than the SIMT path |
-| Vision in the HTTP API | working, one base64 image per request |
-| Multi-image batch / vision queue | **not implemented** |
-| Paged KV / continuous batching | **not implemented** |
-| int8 KV (opt-in) | Engine + BatchEngine, decode/prefill/snapshot, 32-group scales. `MIORI_KV_MIX=vk` (K bf16, V int8) **passes** the gate: top-1 99.560 %, PPL +0.019 %, mean KL 1.46e-4, KV 76.6 % (2.95 → 2.26 GB at Bmax=32). Full `MIORI_KV_INT8=1` is 53.1 % KV but misses top-1 (99.34 %). bf16 is default |
-| Shared-prefix attention / radix cache | **not implemented** |
+| Prefill (MPP tensor-core GEMM, bf16 weight cache) | working, ~2.8K tok/s @1K |
+| Decode (4-bit GEMV, split-K attention) | working, ~95-98 tok/s |
+| OpenAI-compatible HTTP + SSE | working; per-token streaming on batch, exact, sampling and image paths |
+| Batch decode | fixed slots, Bmax=32, dynamic M, exact GEMV for <=4 slots |
+| Packed multi-request prefill (`add_batch`) | 64 x 23-token prompts 2.10 s -> 0.67 s (3.1x), bit-identical |
+| Vision tower (patchifier, 14 layers, projector) | working; 512x480 = 33 ms warm, 1024x992 = 271 ms |
+| Vision in the HTTP API | base64 `image_url`, multi-image requests, 32-entry feature cache |
+| Multi-image ragged tower batch / vision queue | **not implemented** (images encode sequentially) |
+| Paged KV / chunked continuous prefill | **not implemented**; packed prefill + fixed slots |
+| int8 KV (opt-in) | full `MIORI_KV_INT8=1` = 53.1 % KV but top-1 99.34 % (gate missed); mixed `MIORI_KV_MIX=vk` (K bf16/V int8) **passes**: top-1 99.560 %, PPL +0.019 %, KV 76.6 % |
+| Prefix cache | 4 full-prefix snapshots, LRU by system prompt |
+| Per-request exact mode | `{"exact": true}` routes one request through the exact single path |
 
-Measured on the target M6/16GB (headless, 3-run median where applicable):
+Measured on the target M6/16GB:
 
 ```
-prefill 1002 tokens: 0.372 s = 2694 tok/s
-decode 128 tokens:   1.311 s =  97.5 tok/s  (~118 GB/s effective)
-server:              OpenAI /v1/chat/completions + SSE
-vision 512x480 image: 32 ms    (960 patches -> 240 image tokens, warm)
-vision 1024x992 image: 271 ms  (3968 patches -> 992 image tokens, warm)
+prefill 1024 tokens: 0.369 s = 2772 tok/s
+decode 128 tokens:   0.339 s =   94.5 tok/s  (~114 GB/s effective)
+server startup:      ~20 s (bf16 cache build) + warmup
+64 concurrent, 16 output tokens: ~1.94 s
+vision 512x480:      33 ms warm (240 image tokens)
+vision 1024x992:     271 ms warm (992 image tokens)
+resident:            ~10.3 GB text / ~10.8 GB with vision
 ```
+
+Known NO-GO: the original 64x2K/4K @ 2.5K output tok/s target (see
+`docs/BENCHMARKS.md` and `docs/STATUS.md`).
 
 ## Build
 
