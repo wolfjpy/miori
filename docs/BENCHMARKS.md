@@ -129,3 +129,10 @@ sequential `add_sequence`; 64 concurrent 2K prompts would cost roughly
 64 x 1.2 s of prefill before decode. The C2 target (64 x 2K / 4K at 2.5K output
 tok/s) is therefore **not met** with the current packed-prefill design; closing
 it requires chunked continuous prefill and paged KV, not more slots.
+
+## Resident memory
+
+Server startup with Engine bf16 cache + 32-slot BatchEngine + vision + packed
+prefill activations: **~10.2 GB** physical footprint (16 GB machine, recommended
+working set 12.71 GB). A 5-minute 16-concurrent soak (9296 requests) moved it
+10.22 -> 10.28 GB with all requests HTTP 200.

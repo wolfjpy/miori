@@ -10,6 +10,7 @@
 #include <sys/socket.h>
 #include <unistd.h>
 #include <fcntl.h>
+#include <mach/mach.h>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -376,6 +377,14 @@ static void make_suffix(Tokenizer& t, const std::string& user, bool thinking, st
     v.push_back(124901);  // <think>
     if (!thinking) v.push_back(124902);  // </think>
 }
+static long resident_bytes() {
+    task_vm_info_data_t info;
+    mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&info, &n) != KERN_SUCCESS)
+        return 0;
+    return (long)info.phys_footprint;
+}
+
 static const bool g_exact = [] {
     const char* v = getenv("MIORI_EXACT");
     return v && atoi(v) != 0;
@@ -399,7 +408,10 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
                         "miori_queue_depth " + std::to_string(sched.depth()) + "\n"
                         "# HELP miori_image_cache_entries Cached image feature sets\n"
                         "# TYPE miori_image_cache_entries gauge\n"
-                        "miori_image_cache_entries " + std::to_string(g_images.size()) + "\n";
+                        "miori_image_cache_entries " + std::to_string(g_images.size()) + "\n"
+                        "# HELP miori_resident_bytes Resident memory\n"
+                        "# TYPE miori_resident_bytes gauge\n"
+                        "miori_resident_bytes " + std::to_string(resident_bytes()) + "\n";
         std::string r = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
                         std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
         send_all(fd, r);

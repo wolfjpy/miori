@@ -60,3 +60,18 @@ correctness bug in the packed prefill.
 
 This is a short soak, not the 24 h C6 gate. It does exercise packed prefill,
 the 32-slot batch path, continuous admission and slot release repeatedly.
+
+## 5-minute soak with resident memory (added)
+
+`/metrics` now exposes `miori_resident_bytes` (mach task footprint).
+
+16 concurrent greedy requests, 8 output tokens, 300 s:
+
+```
+requests: 9296, all HTTP 200, 74368 output tokens (~31 req/s)
+resident: 10.22 GB -> 10.28 GB (+60 MB over the run)
+```
+
+No crash, no 429/500, no monotonic growth beyond allocator noise. The steady
+footprint is ~10.3 GB, so the 16 GB machine has ~2.4 GB headroom; B=64 with
+bf16 KV (5.9 GB) would not fit without mixed/int8 KV. Still not the 24 h C6 gate.
