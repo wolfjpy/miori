@@ -11,6 +11,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <map>
 #include <memory>
 #include <cstdio>
 #include <cstring>
@@ -91,29 +92,61 @@ public:
         cv_.notify_one();
     }
     void run() {
+        std::map<int, std::shared_ptr<Job>> active;
         for (;;) {
-            std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [&] { return !q_.empty(); });
-            cv_.wait_for(lk, std::chrono::milliseconds(5), [&] { return q_.size() >= (size_t)BatchEngine::kBmax; });
-            std::vector<std::shared_ptr<Job>> batch;
-            while (batch.size() < (size_t)BatchEngine::kBmax && !q_.empty()) {
-                batch.push_back(q_.front());
-                q_.pop_front();
-            }
-            lk.unlock();
-            std::vector<int> slots;
-            slots.reserve(batch.size());
             {
-                std::lock_guard<std::mutex> el(eng_mu_);
-                for (auto& j : batch) slots.push_back(be_.add_sequence(j->prompt, j->max_tokens));
+                std::unique_lock<std::mutex> lk(mu_);
+                if (q_.empty() && active.empty())
+                    cv_.wait(lk, [&] { return !q_.empty(); });
+                if (!q_.empty() && active.size() < (size_t)BatchEngine::kBmax)
+                    cv_.wait_for(lk, std::chrono::milliseconds(5),
+                                 [&] { return q_.size() >= (size_t)BatchEngine::kBmax; });
             }
-            while (be_.running() > 0) be_.decode_step();
-            for (size_t i = 0; i < batch.size(); ++i) {
-                if (slots[i] >= 0) batch[i]->out = be_.generated(slots[i]);
-                { std::lock_guard<std::mutex> jl(batch[i]->m); batch[i]->done = true; }
-                batch[i]->cv.notify_all();
+            // Fill free slots from the queue.
+            for (;;) {
+                std::shared_ptr<Job> j;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (q_.empty()) break;
+                    j = q_.front();
+                }
+                int s = -1;
+                {
+                    std::lock_guard<std::mutex> el(eng_mu_);
+                    s = be_.add_sequence(j->prompt, j->max_tokens);
+                }
+                if (s < 0) break;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (!q_.empty() && q_.front() == j) q_.pop_front();
+                }
+                active[s] = j;
             }
-            be_.clear_slots();
+            if (active.empty()) {
+                // Unserviceable request (e.g. prompt too long): drop it instead of spinning.
+                std::shared_ptr<Job> j;
+                {
+                    std::lock_guard<std::mutex> lk(mu_);
+                    if (!q_.empty()) { j = q_.front(); q_.pop_front(); }
+                }
+                if (j) {
+                    { std::lock_guard<std::mutex> jl(j->m); j->done = true; }
+                    j->cv.notify_all();
+                }
+                continue;
+            }
+            be_.decode_step();
+            std::vector<int> done;
+            for (auto& kv : active)
+                if (be_.finished(kv.first)) done.push_back(kv.first);
+            for (int s : done) {
+                auto j = active[s];
+                j->out = be_.generated(s);
+                be_.release_slot(s);
+                { std::lock_guard<std::mutex> jl(j->m); j->done = true; }
+                j->cv.notify_all();
+                active.erase(s);
+            }
         }
     }
 private:

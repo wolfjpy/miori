@@ -1,4 +1,4 @@
-# STATUS — 2026-10-29
+| C2 | PARTIAL: Bmax=4 continuous-admission batch server; no paged KV/batched prefill |# STATUS — 2026-10-29
 
 ## Delivered and measured
 

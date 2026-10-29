@@ -60,6 +60,9 @@ public:
     const std::vector<int>& tokens(int slot) const { return slots_[slot].tokens; }
     const std::vector<int>& generated(int slot) const { return slots_[slot].generated; }
 
+    void release_slot(int s) {
+        if (s >= 0 && s < kBmax) { slots_[s].active = false; slots_[s].finished = false; }
+    }
     void clear_slots() {
         for (auto& s : slots_) { s.active = false; s.finished = false; s.tokens.clear(); s.generated.clear(); }
     }

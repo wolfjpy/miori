@@ -176,3 +176,19 @@ from 15.3 ms to 33.4 ms (239.6 tok/s aggregate at B=8) because of register
 pressure; B=4 remains the sweet spot at 15.3 ms / 261 tok/s. The server keeps
 Bmax=4. A 4x4 register-tiled batched GEMV or a 32-row MPP tile is the next step
 for B ≥ 8.
+
+## Continuous admission (added)
+
+The scheduler no longer drains a fixed batch: when a slot finishes, its output is
+collected, the slot is released, and the next queued request is prefilled into
+that slot while the remaining slots keep decoding.
+
+8 concurrent requests, 16 output tokens each:
+
+```
+0.792 s wall = 162 output tok/s aggregate
+```
+
+(vs ~2 × 0.45 s for two static batches of four). Prefill for a newly admitted
+request still blocks the batch, because it runs on the shared Engine; batched
+prefill is the next scheduler step.
