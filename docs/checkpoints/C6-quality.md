@@ -90,3 +90,20 @@ request: 1 request in the 100-250 ms bucket, sum 0.125 s.
   ~5700-token prompt: `400`, `/health` still OK.
 - Single-sequence decode loops stop at position 4095 instead of writing past the
   4K KV buffer when `max_tokens` is large.
+
+## 8-minute mixed soak (added)
+
+16 concurrent greedy text requests, plus one cached cat-image request every five
+rounds, 480 s:
+
+```
+requests: 12409, all HTTP 200, 0 errors
+image cache entries: 1 (same image hit)
+resident: 10.22 -> 10.82 GB
+latency: 12409 requests, sum 5930.25 s (mean 0.478 s incl. image requests)
+```
+
+No crash/429/500. Resident footprint rose ~0.6 GB versus the text-only 5-minute
+run, consistent with first-touch of image/vision/packed buffers plus allocator
+high-water; it is still 1.9 GB below the 12.71 GB recommended working set. A 24 h
+soak is still required to distinguish high-water from a slow leak.
