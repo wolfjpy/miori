@@ -77,3 +77,17 @@ Outputs on the batch path are coherent (`The capital of France is` -> `Paris.`).
 The batch path uses bf16 MPP and therefore is not token-identical to the 4-bit
 single-stream path; the single path remains exact. Prefill is still sequential
 and is now roughly half of the 64-concurrent wall time.
+
+## Packed prefill on by default
+
+`MIORI_BATCH_PREFILL` now defaults on. 64 concurrent 23-token prompts,
+16 greedy tokens:
+
+```
+default (add_sequence): 2.94 s
+packed prefill:         1.98-2.11 s  (our 16-token prompt; 1.49-1.60 s for
+                                     shorter/EOS-early prompts)
+```
+
+Responses are byte-identical; the packed prefill pass is bit-identical to the
+sequential path (first-token logits, KV, conv state).

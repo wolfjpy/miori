@@ -277,7 +277,7 @@ request-boundary work stays per request:
 
 `add_sequence`, `decode_step`, the server's default path and the vision path are
 unchanged; the packed prefill is opt-in in the server via
-`MIORI_BATCH_PREFILL=1` (default off).
+`MIORI_BATCH_PREFILL` (default on; `=0` disables).
 
 ### Exactness
 

@@ -217,7 +217,7 @@ public:
             // behaviour is unchanged.
             static const bool batch_prefill = [] {
                 const char* v = getenv("MIORI_BATCH_PREFILL");
-                return v && atoi(v) != 0;
+                return !v || atoi(v) != 0;  // default on; MIORI_BATCH_PREFILL=0 disables
             }();
             if (batch_prefill) {
                 std::vector<std::shared_ptr<Job>> jobs;

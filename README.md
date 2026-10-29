@@ -111,7 +111,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   concurrency targets from `docs/MILESTONES.md` are not met.
 - Fixed-slot batch (Bmax=32) with contiguous per-slot KV; no paged KV and no
   continuous batching. Packed prefill covers up to 32 requests / 1024 tokens per
-  pass (`MIORI_BATCH_PREFILL=1` in the server, off by default); longer prompts
+  pass (`MIORI_BATCH_PREFILL` in the server, on by default; set `=0` to disable); longer prompts
   fall back to the sequential prefill. See `docs/checkpoints/C2-batching.md`.
 - No paged KV, no prefix cache, no int8 KV.
 - Vision works from the CLI only (`vision-run`, `vision-test`); the HTTP API has
