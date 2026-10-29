@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.4
+
+- `/v1/models` reports `owned_by`, `context_length` and `modalities`.
+- Clean build remains warning-free.
+
 ## v0.3.3
 
 - Honor `top_p`, `top_k` and `seed` from chat requests; clamp `max_tokens`.
