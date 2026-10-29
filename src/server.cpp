@@ -87,10 +87,12 @@ struct Job {
 class Scheduler {
 public:
     explicit Scheduler(BatchEngine& be, std::mutex& eng_mu) : be_(be), eng_mu_(eng_mu) {}
-    void submit(const std::shared_ptr<Job>& j) {
-        { std::lock_guard<std::mutex> lk(mu_); q_.push_back(j); }
+    bool submit(const std::shared_ptr<Job>& j) {
+        { std::lock_guard<std::mutex> lk(mu_); if (q_.size() >= 256) return false; q_.push_back(j); }
         cv_.notify_one();
+        return true;
     }
+    size_t depth() { std::lock_guard<std::mutex> lk(mu_); return q_.size(); }
     void run() {
         std::map<int, std::shared_ptr<Job>> active;
         for (;;) {
@@ -199,7 +201,10 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
                         "miori_requests_total " + std::to_string(g_requests.load()) + "\n"
                         "# HELP miori_output_tokens_total Output tokens generated\n"
                         "# TYPE miori_output_tokens_total counter\n"
-                        "miori_output_tokens_total " + std::to_string(g_tokens.load()) + "\n";
+                        "miori_output_tokens_total " + std::to_string(g_tokens.load()) + "\n"
+                        "# HELP miori_queue_depth Queued requests\n"
+                        "# TYPE miori_queue_depth gauge\n"
+                        "miori_queue_depth " + std::to_string(sched.depth()) + "\n";
         std::string r = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
                         std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
         send_all(fd, r);
@@ -272,7 +277,12 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         job->prompt = tok.chat(system, user, thinking);
         job->max_tokens = max_tokens;
         prompt_tokens = job->prompt.size();
-        sched.submit(job);
+        if (!sched.submit(job)) {
+            std::string r = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send_all(fd, r);
+            ::close(fd);
+            return;
+        }
         std::unique_lock<std::mutex> jl(job->m);
         job->cv.wait(jl, [&] { return job->done; });
         out = job->out;
