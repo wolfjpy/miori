@@ -428,4 +428,122 @@ void gemv4x2(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
     e->dispatchThreadgroups(MTL::Size::Make((N + 15) / 16, 1, 1), MTL::Size::Make(256, 1, 1));
 }
 
+void gemv8_off(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* wbuf,
+               uint32_t qoff, uint32_t soff, uint32_t boff, MTL::Buffer* x,
+               MTL::Buffer* y, uint32_t N, uint32_t K, uint32_t xoff,
+               uint32_t yoff) {
+    auto p = m.pso("gemv8");
+    e->setComputePipelineState(p);
+    e->setBuffer(wbuf, qoff, 0);
+    e->setBuffer(wbuf, soff, 1);
+    e->setBuffer(wbuf, boff, 2);
+    e->setBuffer(x, xoff, 3);
+    e->setBuffer(y, yoff, 4);
+    e->setBytes(&N, sizeof(N), 5);
+    e->setBytes(&K, sizeof(K), 6);
+    e->dispatchThreadgroups(MTL::Size::Make((N + 15) / 16, 1, 1),
+                            MTL::Size::Make(512, 1, 1));
+}
+
+void rope_batch(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                MTL::Buffer* k, MTL::Buffer* positions, uint32_t B,
+                float theta, bool partial) {
+    auto p = m.pso("rope_batch");
+    e->setComputePipelineState(p);
+    e->setBuffer(q, 0, 0);
+    e->setBuffer(k, 0, 1);
+    e->setBuffer(positions, 0, 2);
+    e->setBytes(&theta, sizeof(theta), 3);
+    uint32_t part = partial ? 1u : 0u;
+    e->setBytes(&part, sizeof(part), 4);
+    e->dispatchThreadgroups(MTL::Size::Make(B * 20u, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
+void kv_append_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                 MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                 MTL::Buffer* positions, uint32_t B, uint32_t max_seq,
+                 uint32_t kvh) {
+    auto p = m.pso("kv_append_b");
+    e->setComputePipelineState(p);
+    e->setBuffer(k, 0, 0);
+    e->setBuffer(v, 0, 1);
+    e->setBuffer(kc, 0, 2);
+    e->setBuffer(vc, 0, 3);
+    e->setBuffer(positions, 0, 4);
+    e->setBytes(&B, sizeof(B), 5);
+    e->setBytes(&max_seq, sizeof(max_seq), 6);
+    e->setBytes(&kvh, sizeof(kvh), 7);
+    uint64_t total = (uint64_t)B * kvh * 128u;
+    e->dispatchThreads(MTL::Size::Make(total, 1, 1), MTL::Size::Make(256, 1, 1));
+}
+
+void attn_decode_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                   MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* out,
+                   MTL::Buffer* positions, uint32_t B, uint32_t max_seq,
+                   uint32_t kvh, uint32_t window) {
+    auto p = m.pso("attn_decode_b");
+    e->setComputePipelineState(p);
+    e->setBuffer(q, 0, 0);
+    e->setBuffer(kc, 0, 1);
+    e->setBuffer(vc, 0, 2);
+    e->setBuffer(out, 0, 3);
+    e->setBuffer(positions, 0, 4);
+    e->setBytes(&max_seq, sizeof(max_seq), 5);
+    e->setBytes(&kvh, sizeof(kvh), 6);
+    e->setBytes(&window, sizeof(window), 7);
+    e->dispatchThreadgroups(MTL::Size::Make(B * kvh, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
+void conv7_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* gated,
+             MTL::Buffer* bcx, const Weights& w, const Tensor& kernel,
+             MTL::Buffer* state, MTL::Buffer* y, uint32_t cur, uint32_t B,
+             uint32_t H) {
+    auto p = m.pso("conv7_b");
+    e->setComputePipelineState(p);
+    e->setBuffer(gated, 0, 0);
+    e->setBuffer(bcx, 0, 1);
+    e->setBuffer(w.buffer(), kernel.begin, 2);
+    e->setBuffer(state, 0, 3);
+    e->setBuffer(y, 0, 4);
+    e->setBytes(&cur, sizeof(cur), 5);
+    e->setBytes(&B, sizeof(B), 6);
+    e->setBytes(&H, sizeof(H), 7);
+    uint64_t total = (uint64_t)B * H;
+    e->dispatchThreads(MTL::Size::Make(total, 1, 1), MTL::Size::Make(256, 1, 1));
+}
+
+void gemv4_b(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
+             const Tensor& q, const Tensor& s, const Tensor& b, MTL::Buffer* x,
+             MTL::Buffer* y, uint32_t N, uint32_t K, uint32_t B) {
+    auto p = m.pso("gemv4_b");
+    e->setComputePipelineState(p);
+    e->setBuffer(w.buffer(), q.begin, 0);
+    e->setBuffer(w.buffer(), s.begin, 1);
+    e->setBuffer(w.buffer(), b.begin, 2);
+    e->setBuffer(x, 0, 3);
+    e->setBuffer(y, 0, 4);
+    e->setBytes(&N, sizeof(N), 5);
+    e->setBytes(&K, sizeof(K), 6);
+    e->setBytes(&B, sizeof(B), 7);
+    e->dispatchThreadgroups(MTL::Size::Make((N + 15) / 16, 1, 1),
+                            MTL::Size::Make(512, 1, 1));
+}
+
+void gemv8_b(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
+             const Tensor& q, const Tensor& s, const Tensor& b, MTL::Buffer* x,
+             MTL::Buffer* y, uint32_t N, uint32_t K, uint32_t B) {
+    auto p = m.pso("gemv8_b");
+    e->setComputePipelineState(p);
+    e->setBuffer(w.buffer(), q.begin, 0);
+    e->setBuffer(w.buffer(), s.begin, 1);
+    e->setBuffer(w.buffer(), b.begin, 2);
+    e->setBuffer(x, 0, 3);
+    e->setBuffer(y, 0, 4);
+    e->setBytes(&N, sizeof(N), 5);
+    e->setBytes(&K, sizeof(K), 6);
+    e->setBytes(&B, sizeof(B), 7);
+    e->dispatchThreadgroups(MTL::Size::Make((N + 15) / 16, 1, 1),
+                            MTL::Size::Make(512, 1, 1));
+}
+
 }  // namespace miori

@@ -21,3 +21,10 @@
   not a batching server.
 - Streaming is simulated by chunking the already-generated text; TTFT equals full
   generation time.
+
+## 4-slot batch server (added)
+
+Greedy requests are batched up to 4 by a scheduler thread; prefill is sequential,
+decode is shared. 4 concurrent 32-token requests complete in 0.682 s
+(~188 output tok/s aggregate, ~1.9x single-stream). SSE is still emitted after
+generation completes. 64-concurrency remains unmet.

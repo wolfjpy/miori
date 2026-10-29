@@ -35,6 +35,20 @@ public:
     void reset();
     const float* logits() const;
     int pos() const { return pos_; }
+
+    // ---- additive accessors for the C2 batch path -------------------------
+    // The single-sequence API above is unchanged; these only expose the state
+    // a BatchEngine has to read or copy.
+    MTL::Buffer* bf16_buffer() const { return wbf_; }
+    bool has_weight_offset(const Tensor& t) const { return woff_.count(t.name) != 0; }
+    uint32_t weight_offset(const Tensor& t) const;
+    uint32_t bf16_bytes() const { return wbf_used_; }
+    static bool is_attention_layer(int layer);
+    // 1 = full attention, 2 = sliding-window attention, 0 = conv layer.
+    static int layer_kind(int layer);
+    MTL::Buffer* kv_k(int layer) const;       // [4][4096][128] bf16, null for conv
+    MTL::Buffer* kv_v(int layer) const;       // [4][128][4096] bf16, null for conv
+    MTL::Buffer* conv_state(int layer) const;  // live [6][2048] f32, null for attn
     double last_prefill_s() const { return last_prefill_s_; }
     double last_decode_s() const { return last_decode_s_; }
 

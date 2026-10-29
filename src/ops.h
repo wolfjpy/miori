@@ -118,4 +118,47 @@ void gemv4x2(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
              const Tensor& q, const Tensor& s, const Tensor& b,
              MTL::Buffer* x, MTL::Buffer* y, uint32_t N, uint32_t K);
 
+// ---- C2 batch decode -------------------------------------------------------
+
+// gemv8 with explicit byte offsets into x (bf16) and y (f32), used for the
+// per-slot lm_head on a shared [B][2048] / [B][128000] buffer. The 8-bit weight
+// tensors all live in one MTLBuffer, so q/s/b are given as byte offsets.
+void gemv8_off(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* wbuf,
+               uint32_t qoff, uint32_t soff, uint32_t boff, MTL::Buffer* x,
+               MTL::Buffer* y, uint32_t N, uint32_t K, uint32_t xoff,
+               uint32_t yoff);
+
+// RoPE for B rows with a per-slot position buffer.
+void rope_batch(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                MTL::Buffer* k, MTL::Buffer* positions, uint32_t B,
+                float theta, bool partial);
+
+// Append one token per slot at positions[slot].
+void kv_append_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                 MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                 MTL::Buffer* positions, uint32_t B, uint32_t max_seq,
+                 uint32_t kvh);
+
+// Decode attention for B slots, grid B*kvh, per-slot positions and window.
+void attn_decode_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                   MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* out,
+                   MTL::Buffer* positions, uint32_t B, uint32_t max_seq,
+                   uint32_t kvh, uint32_t window);
+
+// Causal 7-tap conv for B slots, one token each, double-buffered state.
+void conv7_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* gated,
+             MTL::Buffer* bcx, const Weights& w, const Tensor& kernel,
+             MTL::Buffer* state, MTL::Buffer* y, uint32_t cur, uint32_t B,
+             uint32_t H);
+
+// 4-bit GEMV over B <= 4 input rows with one pass over the weight row.
+void gemv4_b(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
+             const Tensor& q, const Tensor& s, const Tensor& b, MTL::Buffer* x,
+             MTL::Buffer* y, uint32_t N, uint32_t K, uint32_t B);
+
+// 8-bit GEMV over B <= 4 input rows (batched lm_head).
+void gemv8_b(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
+             const Tensor& q, const Tensor& s, const Tensor& b, MTL::Buffer* x,
+             MTL::Buffer* y, uint32_t N, uint32_t K, uint32_t B);
+
 }  // namespace miori

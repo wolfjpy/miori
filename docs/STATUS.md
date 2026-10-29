@@ -13,12 +13,14 @@
 | OpenAI HTTP + SSE | working, serialized | `C3` |
 | Vision / paged KV / int8 KV | **not implemented** | `C2`, `C4` |
 | Single-prefix KV cache | working in CLI and HTTP (one system slot) | `C5` |
+| Fixed-slot batch decode (Bmax=4) | working, CLI `batch-test` only | `C2` |
 
 ## Milestone verdicts
 
 - M0 C0: GO with exceptions (ICB not attempted).
 - M1 C1: GO with exceptions (97.5 vs 100 tok/s; full CPU top-1 matrix not run).
-- M2 C2: NO-GO (no paged KV / continuous batching).
+- M2 C2: PARTIAL (fixed-slot batch decode up to 4 sequences, token-identical on
+  the batched 4-bit GEMV path; no paged KV, continuous batching or server wiring).
 - M3 C3: PARTIAL (API works; 64-concurrency gate not met).
 - M4 C4: NO-GO (vision tower not executed).
 - M5 C5: PARTIAL (single-prefix snapshot cache; no radix/int8/shared-prefix).
@@ -34,7 +36,8 @@ batching; vision tower) rather than tuning work, and were not started.
 
 ## Next (in order)
 
-1. Paged KV + ragged continuous batching (C2) — unlocks the 高并发 targets.
+1. Paged KV + ragged continuous batching on top of `BatchEngine` (C2) — unlocks
+   the 高并发 targets; fixed-slot decode already works.
 2. Vision tower + projector + ImageIO (C4).
 3. int8 KV, prefix cache, shared-prefix attention (C5).
 4. ICB replay, 24h soak, KL matrix (C5/C6).

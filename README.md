@@ -12,6 +12,8 @@ No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ 
 | Prefill (MPP tensor-core GEMM, bf16 weight cache) | working, ~2.7K tok/s @1K |
 | Decode (4-bit GEMV) | working, ~97 tok/s |
 | OpenAI-compatible HTTP + SSE | working, serialized |
+| Batch decode (fixed slots, Bmax=4) | working, CLI only |
+| Batch decode (Bmax=4) | working, server-integrated |
 | Paged KV / continuous batching | **not implemented** |
 | Vision tower | **not implemented** |
 | int8 KV / prefix cache / shared-prefix attention | **not implemented** |
@@ -74,12 +76,17 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ./build/miori test-conv
 ./build/miori test-tokenizer
 ./build/miori bench --prefill 1024 --decode 128
+./build/miori batch-test --prompts "The capital of France is" "List the first four primes."
+./build/miori batch-test --kernels gemv4 --prompts "..." "..."   # batched 4-bit GEMV path
 ```
 
 ## Known limitations
 
-- Single sequence per process; the HTTP server serializes requests behind a mutex.
-  The 64×2K / 64×4K concurrency targets from `docs/MILESTONES.md` are not met.
+- The HTTP server serializes requests behind a mutex; the 64×2K / 64×4K
+  concurrency targets from `docs/MILESTONES.md` are not met.
+- Batch decode exists only in the CLI test (`batch-test`) with Bmax=4 fixed
+  slots, sequential prefill and contiguous per-slot KV; no paged KV, no
+  continuous batching. See `docs/checkpoints/C2-batching.md`.
 - No paged KV, no prefix cache, no int8 KV.
 - Vision weights are loaded but the vision tower is not executed; image inputs
   are not yet supported by the API.
@@ -98,6 +105,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 ```bash
 ./build/miori bench --prefill 1024 --decode 128
+./build/miori batch-test --prompts "The capital of France is" "List the first four primes."
+./build/miori batch-test --kernels gemv4 --prompts "..." "..."   # batched 4-bit GEMV path
 ```
 
 Reported on the target M6: prefill 2542 tok/s, decode 94.1 tok/s at 1K context

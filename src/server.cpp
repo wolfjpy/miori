@@ -2,11 +2,16 @@
 #include "engine.h"
 #include "tokenizer.h"
 #include "json.h"
+#include "batch.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <memory>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
@@ -69,6 +74,55 @@ static std::string read_request(int fd, std::string& body) {
     return req.substr(0, hdr);
 }
 
+struct Job {
+    std::vector<int> prompt;
+    int max_tokens = 16;
+    std::vector<int> out;
+    bool done = false;
+    std::mutex m;
+    std::condition_variable cv;
+};
+
+class Scheduler {
+public:
+    explicit Scheduler(BatchEngine& be, std::mutex& eng_mu) : be_(be), eng_mu_(eng_mu) {}
+    void submit(const std::shared_ptr<Job>& j) {
+        { std::lock_guard<std::mutex> lk(mu_); q_.push_back(j); }
+        cv_.notify_one();
+    }
+    void run() {
+        for (;;) {
+            std::unique_lock<std::mutex> lk(mu_);
+            cv_.wait(lk, [&] { return !q_.empty(); });
+            cv_.wait_for(lk, std::chrono::milliseconds(5), [&] { return q_.size() >= 4; });
+            std::vector<std::shared_ptr<Job>> batch;
+            while (batch.size() < 4 && !q_.empty()) {
+                batch.push_back(q_.front());
+                q_.pop_front();
+            }
+            lk.unlock();
+            std::vector<int> slots;
+            slots.reserve(batch.size());
+            {
+                std::lock_guard<std::mutex> el(eng_mu_);
+                for (auto& j : batch) slots.push_back(be_.add_sequence(j->prompt, j->max_tokens));
+            }
+            while (be_.running() > 0) be_.decode_step();
+            for (size_t i = 0; i < batch.size(); ++i) {
+                if (slots[i] >= 0) batch[i]->out = be_.generated(slots[i]);
+                { std::lock_guard<std::mutex> jl(batch[i]->m); batch[i]->done = true; }
+                batch[i]->cv.notify_all();
+            }
+            be_.clear_slots();
+        }
+    }
+private:
+    BatchEngine& be_;
+    std::mutex& eng_mu_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::shared_ptr<Job>> q_;
+};
 struct PrefixCache {
     std::string system;
     bool valid = false;
@@ -102,7 +156,7 @@ static void make_suffix(Tokenizer& t, const std::string& user, bool thinking, st
 static std::atomic<long> g_requests{0};
 static std::atomic<long> g_tokens{0};
 
-static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCache& pc) {
+static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCache& pc, Scheduler& sched) {
     std::string body;
     std::string header = read_request(fd, body);
     if (header.empty()) { ::close(fd); return; }
@@ -174,15 +228,31 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
     if (root.contains("chat_template_kwargs") && root["chat_template_kwargs"].contains("enable_thinking"))
         thinking = root["chat_template_kwargs"]["enable_thinking"].boolean;
 
-    std::vector<int> prefix, suffix;
-    make_prefix(tok, system, prefix);
-    make_suffix(tok, user, thinking, suffix);
-
+    std::vector<int> out;
+    size_t prompt_tokens = 0;
     GenConfig cfg;
     cfg.max_tokens = max_tokens;
     cfg.temperature = temp;
-    std::vector<int> out;
-    {
+    if (temp <= 0.01f) {
+        // Greedy requests go through the 4-slot batch decoder.
+        auto job = std::make_shared<Job>();
+        job->prompt = tok.chat(system, user, thinking);
+        job->max_tokens = max_tokens;
+        prompt_tokens = job->prompt.size();
+        sched.submit(job);
+        std::unique_lock<std::mutex> jl(job->m);
+        job->cv.wait(jl, [&] { return job->done; });
+        out = job->out;
+        if (out.empty()) {
+            std::lock_guard<std::mutex> lock(mu);
+            out = eng.generate(job->prompt, cfg);
+        }
+    } else {
+        // Sampling requests keep the single-sequence path (and its prefix cache).
+        std::vector<int> prefix, suffix;
+        make_prefix(tok, system, prefix);
+        make_suffix(tok, user, thinking, suffix);
+        prompt_tokens = prefix.size() + suffix.size();
         std::lock_guard<std::mutex> lock(mu);
         if (!pc.valid || pc.system != system) {
             eng.reset();
@@ -222,9 +292,9 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
                            "\"model\":\"lfm3-vl-2b-mlx-4bit\",\"choices\":[{\"index\":0,"
                            "\"message\":{\"role\":\"assistant\",\"content\":\"" +
                            json_escape(text) + "\"},\"finish_reason\":\"stop\"}],"
-                           "\"usage\":{\"prompt_tokens\":" + std::to_string(prefix.size() + suffix.size()) +
+                           "\"usage\":{\"prompt_tokens\":" + std::to_string(prompt_tokens) +
                            ",\"completion_tokens\":" + std::to_string(out.size()) +
-                           ",\"total_tokens\":" + std::to_string(prefix.size() + suffix.size() + out.size()) + "}}";
+                           ",\"total_tokens\":" + std::to_string(prompt_tokens + out.size()) + "}}";
         std::string r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
                         std::to_string(resp.size()) + "\r\nConnection: close\r\n\r\n" + resp;
         send_all(fd, r);
@@ -244,6 +314,16 @@ int run_server(Metal& m, Weights& w, int port) {
         fprintf(stderr, "engine: %s\n", err.c_str());
         return 1;
     }
+    std::mutex mu;
+    BatchEngine be(m, w, eng);
+    if (!be.init(err)) {
+        fprintf(stderr, "batch engine: %s\n", err.c_str());
+        return 1;
+    }
+    be.set_kernels(BatchEngine::Kernels::Gemv4);
+    Scheduler sched(be, mu);
+    std::thread([&sched]() { sched.run(); }).detach();
+
     int srv = ::socket(AF_INET, SOCK_STREAM, 0);
     if (srv < 0) { perror("socket"); return 1; }
     int one = 1;
@@ -255,15 +335,14 @@ int run_server(Metal& m, Weights& w, int port) {
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); return 1; }
     if (listen(srv, 128) < 0) { perror("listen"); return 1; }
     printf("miori serving on http://127.0.0.1:%d/v1/chat/completions\n", port);
-    std::mutex mu;
     PrefixCache pc;
     std::atomic<int> live{0};
     for (;;) {
         int fd = ::accept(srv, nullptr, nullptr);
         if (fd < 0) continue;
         live.fetch_add(1);
-        std::thread([fd, &eng, &tok, &mu, &pc, &live]() {
-            handle(fd, eng, tok, mu, pc);
+        std::thread([fd, &eng, &tok, &mu, &pc, &sched, &live]() {
+            handle(fd, eng, tok, mu, pc, sched);
             live.fetch_sub(1);
         }).detach();
     }

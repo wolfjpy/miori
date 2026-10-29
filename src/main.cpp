@@ -4,6 +4,7 @@
 #include "cpu_ref.h"
 #include "tokenizer.h"
 #include "engine.h"
+#include "batch.h"
 #include "server.h"
 #include <chrono>
 #include <cstdio>
@@ -456,6 +457,119 @@ int main(int argc, char** argv) {
         printf("prefill: %.3f s  %.1f tok/s\n", p, ids.size() / p);
         printf("decode:  %.3f s  %.1f tok/s  (%.1f GB/s effective)\n",
                d, dlen / d, 1.212e9 * (dlen / d) / 1e9);
+    } else if (cmd == "batch-test") {
+        Tokenizer t;
+        if (!t.load("models/tokenizer.json", err)) {
+            fprintf(stderr, "tokenizer: %s\n", err.c_str());
+            return 1;
+        }
+        std::vector<std::string> prompts;
+        int max_tokens = 16;
+        BatchEngine::Kernels kernels = BatchEngine::Kernels::MppBf16;
+        for (int i = 1; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--prompts") {
+                int j = i + 1;
+                while (j < argc && argv[j][0] != '-') prompts.push_back(argv[j++]);
+                i = j - 1;
+            } else if (a == "--max-tokens" && i + 1 < argc) {
+                max_tokens = atoi(argv[++i]);
+            } else if (a == "--kernels" && i + 1 < argc) {
+                std::string k = argv[++i];
+                if (k == "gemv4") kernels = BatchEngine::Kernels::Gemv4;
+                else if (k != "mpp") {
+                    fprintf(stderr, "batch-test: --kernels must be mpp or gemv4\n");
+                    return 2;
+                }
+            }
+        }
+        if (prompts.empty())
+            prompts = {"The capital of France is", "List the first four primes."};
+        if (prompts.size() < 2) prompts.push_back("What is 2+2?");
+        if ((int)prompts.size() > BatchEngine::kBmax) prompts.resize(BatchEngine::kBmax);
+
+        Engine e(m, w);
+        if (!e.init(err)) {
+            fprintf(stderr, "engine: %s\n", err.c_str());
+            return 1;
+        }
+        BatchEngine be(m, w, e);
+        be.set_kernels(kernels);
+        if (!be.init(err)) {
+            fprintf(stderr, "batch: %s\n", err.c_str());
+            return 1;
+        }
+        const std::string sys = "You are a helpful assistant.";
+        std::vector<std::vector<int>> ids(prompts.size());
+        for (size_t i = 0; i < prompts.size(); ++i) ids[i] = t.chat(sys, prompts[i], false);
+
+        // Reference: single-engine greedy decode, one sequence at a time.
+        GenConfig cfg;
+        cfg.max_tokens = max_tokens;
+        cfg.temperature = 0.0f;
+        std::vector<std::vector<int>> ref(prompts.size());
+        double ref_fwd = 0.0, ref_s = 0.0;
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            ref[i] = e.generate(ids[i], cfg);
+            ref_fwd += (double)(ref[i].size() > 1 ? ref[i].size() - 1 : 0);
+            ref_s += e.last_decode_s();
+        }
+
+        // Batch: sequential prefill into slots, then one batched step per token.
+        std::vector<int> slot(prompts.size(), -1);
+        auto tp0 = std::chrono::steady_clock::now();
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            slot[i] = be.add_sequence(ids[i], max_tokens);
+            if (slot[i] < 0) {
+                fprintf(stderr, "batch: add_sequence failed for prompt %zu\n", i);
+                return 1;
+            }
+        }
+        auto tp1 = std::chrono::steady_clock::now();
+        const double prefill_s = std::chrono::duration<double>(tp1 - tp0).count();
+
+        int guard = max_tokens + 8;
+        while (be.running() > 0 && guard-- > 0) be.decode_step();
+
+        int total = 0, mismatch = 0;
+        for (size_t i = 0; i < prompts.size(); ++i) {
+            const auto& g = be.generated(slot[i]);
+            printf("seq %zu: %zu prompt tokens, %zu generated\n  ref:", i, ids[i].size(), g.size());
+            for (int id : ref[i]) printf(" %d", id);
+            printf("\n  bat:");
+            for (int id : g) printf(" %d", id);
+            printf("\n");
+            const size_t n = std::max(g.size(), ref[i].size());
+            for (size_t k = 0; k < n; ++k) {
+                ++total;
+                const int a = k < ref[i].size() ? ref[i][k] : -1;
+                const int b = k < g.size() ? g[k] : -1;
+                if (a != b) {
+                    if (mismatch == 0)
+                        printf("  first mismatch at token %zu: ref=%d bat=%d\n", k, a, b);
+                    ++mismatch;
+                }
+            }
+        }
+        const double batch_s = be.total_decode_s();
+        const int batch_tok = be.total_generated();
+        const double agg = batch_tok / std::max(1e-9, batch_s);
+        const double ref_rate = ref_s > 0.0 ? ref_fwd / ref_s : 0.0;
+        printf("\nbatch-test: B=%zu (Bmax=%d), max_tokens=%d, kernels=%s\n", prompts.size(),
+               BatchEngine::kBmax, max_tokens, be.kernels_name());
+        printf("prefill (sequential Engine): %.3f s\n", prefill_s);
+        printf("reference single-stream decode: %.0f forwards in %.3f s = %.1f tok/s\n",
+               ref_fwd, ref_s, ref_rate);
+        printf("batch decode: %d steps, %d tokens in %.3f s = %.1f tok/s aggregate "
+               "(%.2f ms/step)\n",
+               be.steps(), batch_tok, batch_s, agg,
+               1000.0 * batch_s / std::max(1, be.steps()));
+        printf("tokens compared: %d, mismatches: %d\n", total, mismatch);
+        printf("aggregate speedup vs sequential single-stream: %.2fx\n",
+               agg / std::max(1e-9, ref_rate));
+        if (mismatch == 0) printf("RESULT: token-identical to single-sequence greedy\n");
+        else printf("RESULT: %d/%d tokens differ (bf16 MPP GEMM vs 4-bit GEMV numerics)\n",
+                    mismatch, total);
     } else if (cmd == "run") {
         Tokenizer t;
         if (!t.load("models/tokenizer.json", err)) {

@@ -171,6 +171,37 @@ bool Engine::init(std::string& err) {
     return true;
 }
 
+bool Engine::is_attention_layer(int layer) {
+    return layer >= 0 && layer < 24 && kLayerSuffix[layer][0] == 's';
+}
+
+int Engine::layer_kind(int layer) {
+    if (!is_attention_layer(layer)) return 0;
+    switch (layer) {
+        case 2: case 6: case 10: case 14: case 18: case 22:
+            return 1;   // full attention
+        default:
+            return 2;   // sliding-window attention
+    }
+}
+
+uint32_t Engine::weight_offset(const Tensor& t) const {
+    auto it = woff_.find(t.name);
+    return it == woff_.end() ? 0u : it->second;
+}
+
+MTL::Buffer* Engine::kv_k(int layer) const {
+    return is_attention_layer(layer) ? kc_[layer] : nullptr;
+}
+
+MTL::Buffer* Engine::kv_v(int layer) const {
+    return is_attention_layer(layer) ? vc_[layer] : nullptr;
+}
+
+MTL::Buffer* Engine::conv_state(int layer) const {
+    return is_attention_layer(layer) ? nullptr : cs_[layer][cs_cur_[layer]];
+}
+
 const Tensor& Engine::norm(int layer, const char* which) const {
     return w_.get("language_model.model.layers." + std::to_string(layer) + "." + which);
 }
@@ -216,8 +247,7 @@ void Engine::attn_layer(int layer, int pos) {
     gemv4(m_, e_, w_, *vq, *vs, *vb, h_, v_, vn, vk);
     gemv4(m_, e_, w_, *gq, *gs, *gb, h_, gate_, gn, gk);
     // full/sliding decided by config order below
-    const int type = (layer == 2 || layer == 6 || layer == 10 || layer == 14 ||
-                      layer == 18 || layer == 22) ? 1 : 2;
+    const int type = layer_kind(layer);
     const bool partial = (type == 1);
     const float theta = partial ? 1000000.0f : 10000.0f;
     rmsnorm(m_, e_, q_, w_, w_.get("language_model.model.layers." + std::to_string(layer) +
@@ -312,8 +342,7 @@ void Engine::p_attn(int layer, int T, int start) {
     rmsnorm(m_, e_, pk_, w_, w_.get("language_model.model.layers." + std::to_string(layer) +
                                    ".self_attn.k_norm.weight"),
             pkn_, T * 4, 128, 1e-5f);
-    const int type = (layer == 2 || layer == 6 || layer == 10 || layer == 14 ||
-                      layer == 18 || layer == 22) ? 1 : 2;
+    const int type = layer_kind(layer);
     const bool partial = (type == 1);
     const float theta = partial ? 1000000.0f : 10000.0f;
     rope_b(m_, e_, pqn_, pkn_, T, (uint32_t)start, theta, partial);
