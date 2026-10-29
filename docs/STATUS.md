@@ -1,64 +1,79 @@
-# STATUS — 2026-10-29
-- C2: PARTIAL — packed multi-request prefill landed (64 x 23-token prompts 2.10 s -> 0.67 s, bit-identical, server default); still no paged KV or continuous batching.
-- C5: PARTIAL — optional int8 KV is implemented end to end (Engine + BatchEngine, prefill/decode/snapshot). Full int8 (`MIORI_KV_INT8=1`) cuts KV to 53.1 % but misses the strict gate (top-1 99.34 %); **mixed `MIORI_KV_MIX=vk` (K bf16, V int8) passes**: top-1 99.560 %, PPL +0.019 %, mean KL 1.46e-4, p99 KL 1.24e-3, KV 76.6 % (2.95 -> 2.26 GB at Bmax=32). Both are opt-in; bf16 stays default. See `docs/checkpoints/C5-int8-kv-mixed.md`.
+# STATUS — 2026-10-29 (v0.3.1)
 
-## Delivered and measured
+Miori is a Metal + C++20 LFM3-VL-2B-MLX-4bit engine for the Apple M6 / 16 GB
+Mac mini. Text, batching, vision, mixed-precision KV, prefix snapshots and
+streaming are implemented and measured. The original 64x2K/4K @ 2.5K output
+tok/s target is **NO-GO** with the current fixed-slot / packed-prefill design.
+
+## Capability snapshot
 
 | Capability | State | Evidence |
 |---|---|---|
 | safetensors loader (732 tensors, 1.59 GB) | working | `miori info` |
-| 4-bit GEMV / 8-bit GEMV | exact vs CPU | `C0`, `C6` |
-| 24-layer text model + KV + conv state | working | `The capital of France is` → `Paris` |
-| 128K BPE tokenizer + LFM3 chat template | working | `test-tokenizer` |
-| MPP tensor-core prefill (bf16 cache) | 2694 tok/s @1K | `C1` |
-| 4-bit decode | 97.5 tok/s (short ctx), 94.1 tok/s (1K ctx, 16-way split-K) | `C1` |
-| OpenAI HTTP + SSE | working, serialized | `C3` |
-| Vision tower + projector + splice | working in CLI (`vision-run`); 512² = 32 ms (warm) | `C4` |
-| Vision on MPP tensor cores | 8.2× vs SIMT: 261 → 32 ms (512²), 2028 → 271 ms (1024²) | `C4` |
-| Vision in HTTP API | working (one base64 image per request) | `C4` |
-| Multi-image batch / vision queue | **not implemented** | `C4` |
-| Paged KV | **not implemented** | `C2` |
-| int8 KV, full (`MIORI_KV_INT8=1`) | working; 32-group scales; 53.1 % KV bytes; PPL -0.07 %, top-1 99.34 %, mean KL 2.2e-4 (strict 99.5 % top-1 gate missed) | `C5-int8-kv-groups` |
-| mixed KV, `MIORI_KV_MIX=vk` (K bf16/V int8) | **working and gate-passing**: 76.6 % KV bytes; PPL +0.019 %, top-1 99.560 %, mean KL 1.46e-4, p99 KL 1.24e-3 | `C5-int8-kv-mixed` |
-| 4-prefix KV snapshot cache | working in CLI and HTTP (LRU by system prompt) | `C5` |
-| Fixed-slot batch decode (Bmax=32) | working, server-integrated (hybrid 1 / B=32) | `C2` |
-| Packed multi-request prefill | working: 64 x 23-token prompts 2.10 s -> 0.67 s (3.13x), first-token logits / KV / conv state bit-identical | `C2` |
+| 4-bit / 8-bit GEMV, MPP prefill | exact vs CPU | `C0`, `REGRESSION` |
+| 24-layer text model + KV + conv state | working | `Paris` |
+| Tokenizer + LFM3 chat template | working | `test-tokenizer` |
+| Single-stream decode | 98 tok/s short, 94.1 @1K, 92.2 @4K | `C1` |
+| Single-stream prefill | 2.8K @1K, 1.66K @4K | `BENCHMARKS` |
+| Batch decode | Bmax=32, dynamic M, exact GEMV for <=4 slots | `C2` |
+| Packed multi-request prefill | 64x23 tok: 2.10 s -> 0.67 s, bit-identical | `C2` |
+| HTTP server | OpenAI chat, SSE streaming, per-request `exact` | `C3` |
+| 64 concurrent (16 output tok) | ~1.94 s wall | `C3` |
+| Vision tower + projector + splice | 512² 33 ms warm, 1024² 271 ms | `C4` |
+| Image API | base64 `image_url`, multi-image, feature cache | `C4` |
+| KV snapshots | 4-prefix LRU (system prompt) | `C5` |
+| int8 KV (full) | 53.1% KV, top-1 99.34% (strict gate missed) | `C5-int8-kv-groups` |
+| mixed KV `MIORI_KV_MIX=vk` | **gate-passing**: top-1 99.560%, PPL +0.019%, KV 76.6% | `C5-int8-kv-mixed` |
+| Paged / radix KV | **not implemented** | `C2`/`C5` |
+| Multi-image ragged tower batch | **not implemented** | `C4` |
+| 24 h soak / KL matrix | **not done** (8 min / 12k-request soak done) | `C6` |
 
 ## Milestone verdicts
 
-- M0 C0: GO with exceptions (ICB not attempted).
-- M1 C1: GO with exceptions (97.5 vs 100 tok/s; full CPU top-1 matrix not run).
-- M2 C2: PARTIAL — fixed-slot batch decode (Bmax=32) is server-integrated and
-  packed multi-request prefill now makes 64 short prompts 3.1x faster
-  (2.10 s -> 0.67 s) with bit-identical first-token logits, KV and conv state;
-  paged KV and continuous (chunked) batching are still missing.
-- M3 C3: PARTIAL (API works; 64-concurrency gate not met).
-- M4 C4: GO — captions end to end (CPU cosine 0.9997), 512² 32 ms warm vs the
-  40 ms gate, 1024² 271 ms vs 600 ms. Not wired into the HTTP API and no
-  multi-image batch; fused flash attention would remove the remaining N² traffic.
-- M5 C5: PARTIAL — 4-prefix snapshot cache and optional int8 KV are
-  implemented. Full int8 misses the 99.5 % top-1 gate (99.34 %), but the mixed
-  `MIORI_KV_MIX=vk` mode (K bf16, V int8) passes all four gates (top-1 99.560 %,
-  PPL +0.019 %, mean KL 1.46e-4, p99 KL 1.24e-3). Both are opt-in; bf16 remains
-  default. No radix or shared-prefix cache.
-- M6 C6: PARTIAL (kernel-level validation only).
-- M7 C7: PARTIAL (v0.1.0-core).
+- **M0 C0**: GO with exceptions (ICB replay not attempted).
+- **M1 C1**: GO with exceptions — 98 vs 100 tok/s short-context; full CPU top-1
+  matrix not run.
+- **M2 C2**: PARTIAL / 2K target **NO-GO**. Packed prefill is bit-identical and
+  3.1x faster; dynamic-M batch and exact GEMV for <=4 slots work. No paged KV,
+  no chunked continuous prefill, no prefill/decode overlap. A 3781-token prompt
+  takes 2.33 s prefill; 64x2K would be ~64 x 1.2 s of prefill alone.
+- **M3 C3**: PARTIAL — all main paths stream SSE per token; per-request `exact`;
+  `/health`, `/metrics` (resident, latency histogram, queue, image cache).
+  64-concurrency aggregate target not met.
+- **M4 C4**: GO — real captions, CPU fp32 cosine 0.9997, 512² 33 ms warm
+  (40 ms gate), 1024² 271 ms (600 ms gate), multi-image base64 requests,
+  feature cache, streaming. No ragged multi-image tower batch/queue.
+- **M5 C5**: PARTIAL — 4-prefix LRU snapshots; full int8 misses 99.5% top-1,
+  mixed `vk` passes all four gates (top-1 99.560%, PPL +0.019%, mean KL
+  1.46e-4, p99 1.24e-3). Opt-in; bf16 default. No radix/shared pages.
+- **M6 C6**: PARTIAL — kernel tests, PPL, KV modes, 12,409-request mixed soak,
+  resident high-water verified stable across 100 image requests. No 24 h run or
+  full KL matrix.
+- **M7 C7**: **v0.3.1 released** (v0.3.0 features + regression matrix);
+  binaries, benchmarks, checkpoints and changelog are present.
 
-## Why
+## Known gaps (in order of impact)
 
-This session prioritised a correct, measured single-stream engine over breadth:
-the 4-bit layout, attention, conv, prefill and serving path were debugged end to
-end. The remaining milestones are substantial subsystems (paged KV + continuous
-batching; vision tower) rather than tuning work, and were not started.
+1. **C2 64x2K/4K target**: needs chunked continuous prefill + paged KV and a
+   faster MPP path at M=32/64; slot count alone is not the limit.
+2. **Paged/radix KV**: per-slot 4K KV is 92 MB (49 MB full int8, 71 MB mixed);
+   no page sharing/copy-on-write.
+3. **C6 24 h soak / KL matrix**: 12k-request and 100-image runs are stable;
+   24 h and a full domain matrix remain.
+4. **Vision ragged batch/queue**: multi-image requests encode sequentially.
+5. **Full int8 KV**: 99.34% top-1; needs asymmetric zero point, mixed K/V
+   (already passing as `vk`), or higher precision.
 
-## Next (in order)
+## Reproduce
 
-1. Paged KV + ragged continuous batching on top of `BatchEngine` (C2): merge
-   prefill and decode in one step (a packed prefill pass currently blocks the
-   batch), pack more than 32 requests / 1024-token prompts per pass, and lift the
-   4-bit batched GEMV path back to a usable B ≤ 4 mode.
-2. Vision in the serving path: image_url/base64 input, vision queue, MPP bf16
-   GEMM for the tower (C4 latency), multi-image ragged batch.
-3. int8 KV: mixed V-int8 now passes; full int8 still needs an asymmetric zero
-   point or higher precision. Next: radix and shared-prefix attention (C5).
-4. ICB replay, 24h soak, KL matrix (C5/C6).
+```bash
+make clean && make -j
+./build/miori run --raw --prompt "The capital of France is" --max-tokens 4
+./build/miori bench --prefill 1024 --decode 32
+./build/miori batch-prefill-test --n 32
+./build/miori batch-sparse-test
+./build/miori vision-run --image cat.jpg --prompt "Describe this image." --max-tokens 16
+./build/miori serve --port 8080
+```
+
+See `docs/BENCHMARKS.md`, `docs/REGRESSION.md`, and `docs/checkpoints/`.
