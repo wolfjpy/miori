@@ -341,6 +341,10 @@ static void make_suffix(Tokenizer& t, const std::string& user, bool thinking, st
     v.push_back(124901);  // <think>
     if (!thinking) v.push_back(124902);  // </think>
 }
+static const bool g_exact = [] {
+    const char* v = getenv("MIORI_EXACT");
+    return v && atoi(v) != 0;
+}();
 static std::atomic<long> g_requests{0};
 static std::atomic<long> g_tokens{0};
 
@@ -501,7 +505,7 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
             out = eng.decode_loop(cfg);
         }
         prompt_tokens = ids.size();
-    } else if (temp <= 0.01f) {
+    } else if (temp <= 0.01f && !g_exact) {
         // Greedy requests go through the 4-slot batch decoder.
         auto job = std::make_shared<Job>();
         job->prompt = tok.chat(system, user, thinking);

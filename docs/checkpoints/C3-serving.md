@@ -91,3 +91,9 @@ packed prefill:         1.98-2.11 s  (our 16-token prompt; 1.49-1.60 s for
 
 Responses are byte-identical; the packed prefill pass is bit-identical to the
 sequential path (first-token logits, KV, conv state).
+
+## Exact mode
+
+`MIORI_EXACT=1` disables the batch/MPP path and serves every greedy request
+through the single Engine (4-bit GEMV + prefix cache). This is token-exact but
+serial; default remains hybrid for aggregate throughput.

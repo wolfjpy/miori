@@ -33,3 +33,19 @@ with BOS PPL 18.6 and `Paris` is rank 0 (NLL 0.004).
 The English PPL is higher than expected for a 2B model; possible causes are the
 approximate Unicode pre-tokenizer and the mixed-domain corpus. It is reported as
 a regression baseline, not as a quality pass.
+
+## Batch MPP vs exact single-stream (added)
+
+`batch-test --kernels mpp`, 8 prompts, 32 greedy tokens:
+
+```
+batch decode: 31 steps, 248 tokens, 45.95 ms/step, 174 tok/s
+tokens compared: 256, mismatches: 28 (89.1% agreement)
+```
+
+Packed prefill is bit-identical (first-token logits/KV/conv state), so the drift
+comes from the bf16 MPP decode GEMM vs the 4-bit GEMV of the exact path.
+`MIORI_EXACT=1` forces the server onto the exact single-sequence path; default
+server uses MPP for bursts (aggregate throughput priority) and the exact path for
+queues <4. This is a documented throughput/bit-exactness trade-off, not a
+correctness bug in the packed prefill.

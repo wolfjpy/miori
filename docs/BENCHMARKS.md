@@ -72,5 +72,6 @@ to the token path (`max |Δlogit| = 0`).
 - Vision is one image at a time in the tower; multi-image requests encode
   sequentially. No ragged vision batch or vision queue.
 - int8 KV and radix prefix cache are not implemented.
-- Server batch path uses bf16 MPP and is not token-identical to the exact
-  4-bit single-stream path (single path remains exact).
+- Server batch path uses bf16 MPP; over 8 prompts x 32 tokens it agrees with
+  the exact 4-bit path on 89.1% of tokens. `MIORI_EXACT=1` forces the exact
+  single-sequence path.
