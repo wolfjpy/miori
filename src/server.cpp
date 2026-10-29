@@ -180,6 +180,7 @@ public:
     int backlog() { std::lock_guard<std::mutex> lk(mu_); return (int)q_.size() + active_cnt_.load(); }
     void run() {
         std::map<int, std::shared_ptr<Job>> active;
+        std::map<int, size_t> streamed;
         for (;;) {
             {
                 std::unique_lock<std::mutex> lk(mu_);
@@ -242,6 +243,7 @@ public:
                     for (size_t k = 0; k < jobs.size(); ++k) {
                         if (slots[k] >= 0) {
                             active[slots[k]] = jobs[k];
+                            streamed[slots[k]] = 0;
                             active_cnt_.fetch_add(1);
                         } else {
                             // Unpackable request (e.g. too long): fail it closed;
@@ -271,6 +273,7 @@ public:
                         if (!q_.empty() && q_.front() == j) q_.pop_front();
                     }
                     active[s] = j;
+                    streamed[s] = 0;
                     active_cnt_.fetch_add(1);
                 }
             }
@@ -288,16 +291,33 @@ public:
                 continue;
             }
             be_.decode_step();
+            for (auto& kv : active) {
+                const int s = kv.first;
+                auto g = be_.generated(s);
+                size_t& seen = streamed[s];
+                if (g.size() > seen) {
+                    std::lock_guard<std::mutex> jl(kv.second->m);
+                    for (size_t i = seen; i < g.size(); ++i) kv.second->out.push_back(g[i]);
+                    seen = g.size();
+                    kv.second->cv.notify_all();
+                }
+            }
             std::vector<int> done;
             for (auto& kv : active)
                 if (be_.finished(kv.first)) done.push_back(kv.first);
             for (int s : done) {
                 auto j = active[s];
-                j->out = be_.generated(s);
+                auto g = be_.generated(s);
+                {
+                    std::lock_guard<std::mutex> jl(j->m);
+                    for (size_t i = streamed[s]; i < g.size(); ++i) j->out.push_back(g[i]);
+                    streamed[s] = g.size();
+                    j->done = true;
+                }
                 be_.release_slot(s);
-                { std::lock_guard<std::mutex> jl(j->m); j->done = true; }
                 j->cv.notify_all();
                 active.erase(s);
+                streamed.erase(s);
                 active_cnt_.fetch_sub(1);
             }
         }
@@ -530,6 +550,63 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         if (!sched.submit(job)) {
             std::string r = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             send_all(fd, r);
+            ::close(fd);
+            return;
+        }
+        if (stream) {
+            std::string h = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                            "Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            if (!send_all(fd, h)) { ::close(fd); return; }
+            size_t seen = 0;
+            std::vector<int> all;
+            std::string sent;
+            for (;;) {
+                std::vector<int> chunk;
+                bool done = false;
+                {
+                    std::unique_lock<std::mutex> jl(job->m);
+                    job->cv.wait(jl, [&] { return job->done || job->out.size() > seen; });
+                    chunk.assign(job->out.begin() + (long)seen, job->out.end());
+                    seen = job->out.size();
+                    done = job->done;
+                }
+                if (!chunk.empty()) {
+                    all.insert(all.end(), chunk.begin(), chunk.end());
+                    std::string full = tok.decode_plain(all);
+                    if (full.size() > sent.size()) {
+                        std::string piece = full.substr(sent.size());
+                        sent = full;
+                        std::string ev = "data: {\"id\":\"chatcmpl-miori\",\"object\":\"chat.completion.chunk\","
+                                         "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
+                                         json_escape(piece) + "\"},\"finish_reason\":null}]}\n\n";
+                        if (!send_all(fd, ev)) { ::close(fd); return; }
+                    }
+                }
+                if (done) break;
+            }
+            if (!all.empty()) {
+                g_requests.fetch_add(1);
+                g_tokens.fetch_add((long)all.size());
+            }
+            if (all.empty()) {
+                std::vector<int> fb;
+                {
+                    std::lock_guard<std::mutex> lock(mu);
+                    fb = eng.generate(job->prompt, cfg);
+                }
+                g_requests.fetch_add(1);
+                g_tokens.fetch_add((long)fb.size());
+                std::string full = tok.decode_plain(fb);
+                if (!full.empty()) {
+                    std::string ev = "data: {\"id\":\"chatcmpl-miori\",\"object\":\"chat.completion.chunk\","
+                                     "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
+                                     json_escape(full) + "\"},\"finish_reason\":null}]}\n\n";
+                    send_all(fd, ev);
+                }
+            }
+            send_all(fd, "data: {\"id\":\"chatcmpl-miori\",\"choices\":[{\"index\":0,\"delta\":{},"
+                         "\"finish_reason\":\"stop\"}]}\n\n");
+            send_all(fd, "data: [DONE]\n\n");
             ::close(fd);
             return;
         }

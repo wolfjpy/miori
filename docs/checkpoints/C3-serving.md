@@ -108,3 +108,18 @@ when ≤4 low slots are active. 16 greedy tokens:
 16 concurrent: 0.996 s
 64 concurrent: 1.94 s
 ```
+
+## True token streaming for the batch path (added)
+
+For greedy requests served by the batch scheduler, the scheduler now appends each
+newly sampled token to `job->out` and notifies the handler after every
+`decode_step`; the handler sends the SSE header before generation and emits a
+delta as soon as tokens arrive. Non-stream responses are unchanged.
+
+Verified with 4 concurrent stream requests: the concatenated `delta.content`
+reconstructs the full answer exactly, and 8 concurrent stream requests complete
+in 0.78 s with 16 tokens each.
+
+Limitations: the small-queue single path, `MIORI_EXACT=1`, image requests and
+temperature sampling still emit SSE after generation (one or more chunks), not
+per token; only the batch path is token-streamed.
