@@ -193,7 +193,8 @@ void BatchEngine::linear(MTL::Buffer* A, MTL::Buffer* C, const Proj& p) {
     if (use_gemv_) {
         gemv4_b(m_, e_, w_, *p.wt, *p.sc, *p.bi, A, C, p.N, p.K, (uint32_t)step_b_);
     } else {
-        gemm_mpp(m_, e_, A, eng_.bf16_buffer(), C, (uint32_t)step_b_, p.N, p.K, p.off);
+        if (step_b_ <= 32) gemm_mpp32(m_, e_, A, eng_.bf16_buffer(), C, (uint32_t)step_b_, p.N, p.K, p.off);
+        else gemm_mpp(m_, e_, A, eng_.bf16_buffer(), C, (uint32_t)step_b_, p.N, p.K, p.off);
     }
 }
 

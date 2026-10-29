@@ -64,7 +64,7 @@ kernel void gemm_mpp32(device bfloat* A [[buffer(0)]],
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA(A, dextents<int32_t, 2>(int(K), int(M)));
     tensor<device float, dextents<int32_t, 2>, tensor_inline> tC(C, dextents<int32_t, 2>(int(N), int(M)));
     constexpr auto desc = matmul2d_descriptor(32, 64, static_cast<int>(dynamic_extent));
-    matmul2d<desc, execution_simdgroups<2>> op;
+    matmul2d<desc, execution_simdgroups<4>> op;
     auto mA = tA.slice(0, int(tgid.y) * 32);
     auto mC = tC.slice(int(tgid.x) * 64, int(tgid.y) * 32);
     tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tB(

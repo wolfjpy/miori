@@ -429,3 +429,12 @@ fallback above).
 A 64x64 `matmul2d` with `execution_simdgroups<8>` (256 threads) was measured at
 B=32: 48.8 ms/step / 655 tok/s, slightly worse than the 4-group kernel
 (46.8 ms / 684 tok/s). Reverted; 4 simdgroups remains best.
+
+### M tile experiments at B=32
+
+- Fusing w1/w3 into one `gemm_mpp2` dispatch: **55.96 ms/step / 572 tok/s**,
+  worse than two dispatches (46.8 ms); the two matmuls serialise inside a
+  threadgroup. Reverted.
+- 32-row `m=32,n=64` tile with 4 simdgroups for `step_b_ <= 32`:
+  **46.34 ms/step / 691 tok/s** vs 46.76 ms for the 64-row tile. Within noise,
+  but it avoids wasted M rows; kept for M<=32, 64-row tile for M>32.

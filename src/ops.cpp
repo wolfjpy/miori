@@ -643,7 +643,7 @@ void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
     e->setBytes(&M, sizeof(M), 3);
     e->setBytes(&N, sizeof(N), 4);
     e->setBytes(&K, sizeof(K), 5);
-    e->dispatchThreadgroups(MTL::Size::Make(N / 64, (M + 31) / 32, 1), MTL::Size::Make(64, 1, 1));
+    e->dispatchThreadgroups(MTL::Size::Make(N / 64, (M + 31) / 32, 1), MTL::Size::Make(128, 1, 1));
 }
 
 
