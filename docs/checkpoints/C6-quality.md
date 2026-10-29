@@ -82,3 +82,11 @@ bf16 KV (5.9 GB) would not fit without mixed/int8 KV. Still not the 24 h C6 gate
 10 ms .. 10 s + `+Inf`, count and sum), measured from the start of request
 handling to the response/stream completion. Verified with a 4-token `2+2`
 request: 1 request in the 100-250 ms bucket, sum 0.125 s.
+
+## Length guards (added)
+
+- Chat requests whose prompt reaches 4096 tokens return `400 Bad Request` before
+  allocating/prefilling (image requests already cap at 4000). Verified with a
+  ~5700-token prompt: `400`, `/health` still OK.
+- Single-sequence decode loops stop at position 4095 instead of writing past the
+  4K KV buffer when `max_tokens` is large.

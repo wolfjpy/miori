@@ -633,6 +633,12 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         job->max_tokens = max_tokens;
         job->temperature = temp;
         prompt_tokens = job->prompt.size();
+        if (job->prompt.size() >= 4096) {
+            std::string r = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send_all(fd, r);
+            ::close(fd);
+            return;
+        }
         if (!sched.submit(job)) {
             std::string r = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             send_all(fd, r);
@@ -709,6 +715,12 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         make_prefix(tok, system, prefix);
         make_suffix(tok, user, thinking, suffix);
         prompt_tokens = prefix.size() + suffix.size();
+        if (prompt_tokens >= 4096) {
+            std::string r = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            send_all(fd, r);
+            ::close(fd);
+            return;
+        }
         std::lock_guard<std::mutex> lock(mu);
         int slot = pc.find(system);
         if (slot < 0) {
