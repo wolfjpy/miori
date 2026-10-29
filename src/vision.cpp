@@ -269,6 +269,7 @@ static MTL::Buffer* grow(Metal& m, MTL::Buffer*& b, size_t bytes) {
 void Vision::ensure(int n_patches) {
     if (n_patches <= cap_patches_) return;
     const size_t N = (size_t)n_patches;
+    const size_t pseq = (size_t)((n_patches + 63) / 64) * 64;  // padded key count
     grow(m_, patches_, N * 1536 * 2);
     grow(m_, x_, N * 1024 * 4);
     grow(m_, h_, N * 1024 * 2);
@@ -277,8 +278,11 @@ void Vision::ensure(int n_patches) {
     grow(m_, vf_, N * 512 * 4);
     grow(m_, qn_, N * 1024 * 2);
     grow(m_, kn_, N * 512 * 2);
-    grow(m_, vt_, N * 512 * 2);
-    grow(m_, attn_, N * 1024 * 4);
+    grow(m_, qh_, N * 1024 * 2);
+    grow(m_, kh_, pseq * 512 * 2);
+    grow(m_, vh_, pseq * 512 * 2);
+    grow(m_, ktile_, pseq * 512 * 2);
+    grow(m_, attn_h_, N * 1024 * 4);
     grow(m_, attn_b_, N * 1024 * 2);
     grow(m_, proj_, N * 1024 * 4);
     grow(m_, bcx_, N * 3072 * 4);
@@ -289,8 +293,8 @@ void Vision::ensure(int n_patches) {
     grow(m_, fu_, N * 2560 * 4);
     grow(m_, fact_, N * 2560 * 2);
     grow(m_, down_, N * 1024 * 4);
-    grow(m_, scores_, N * 128 * 4);
-    grow(m_, probs_, N * 128 * 2);
+    grow(m_, scores_, pseq * 1024 * 4);
+    grow(m_, probs_, pseq * 1024 * 2);
     grow(m_, ln_, N * 1024 * 2);
     grow(m_, lin1_, N * 4096 * 4);
     grow(m_, gelu_, N * 4096 * 2);
@@ -325,6 +329,65 @@ bool Vision::init(std::string& err) {
             w_.get(base + "feed_forward.w2.weight");
             w_.get(base + "feed_forward.w3.weight");
         }
+
+        // ---- bf16 tile-major cache for the dense GEMMs (tensor cores) -------
+        // Every dense weight is copied once into the [N/64][K][64] layout that
+        // gemm_mpp consumes, so the tower runs on matmul2d instead of the SIMT
+        // gemm_naive. Weights stay in the safetensors mapping too (the CPU
+        // reference and the non-GEMM kernels still read them from there).
+        std::vector<std::string> tiled;
+        tiled.push_back("vision_tower.patchifier.weight");
+        for (int l = 0; l < cfg_.layers; ++l) {
+            const std::string base = "vision_tower.layers." + std::to_string(l) + ".";
+            if (kVisionKind[l]) {
+                tiled.push_back(base + "self_attn.q_proj.weight");
+                tiled.push_back(base + "self_attn.k_proj.weight");
+                tiled.push_back(base + "self_attn.v_proj.weight");
+                tiled.push_back(base + "self_attn.out_proj.weight");
+            } else {
+                tiled.push_back(base + "conv.in_proj.weight");
+                tiled.push_back(base + "conv.out_proj.weight");
+            }
+            tiled.push_back(base + "feed_forward.w1.weight");
+            tiled.push_back(base + "feed_forward.w3.weight");
+            tiled.push_back(base + "feed_forward.w2.weight");
+        }
+        tiled.push_back("multi_modal_projector.linear_1.weight");
+        tiled.push_back("multi_modal_projector.linear_2.weight");
+
+        uint32_t used = 0;
+        for (const std::string& n : tiled) {
+            const Tensor& t = w_.get(n);
+            if (t.shape.size() != 2 || t.dtype != "BF16")
+                throw std::runtime_error("vision: unexpected layout for " + n);
+            const uint32_t N = (uint32_t)t.rows(), K = (uint32_t)t.cols();
+            if (N % 64u != 0u) throw std::runtime_error("vision: N is not a multiple of 64: " + n);
+            used = (used + 255u) & ~255u;
+            woff_[n] = used;
+            used += N * K * 2u;
+        }
+        wtile_ = m_.new_buffer(used);
+        wtile_used_ = used;
+        MTL::CommandBuffer* tcb = m_.begin();
+        MTL::ComputeCommandEncoder* tenc = tcb->computeCommandEncoder();
+        for (const std::string& n : tiled) {
+            const Tensor& t = w_.get(n);
+            const uint32_t N = (uint32_t)t.rows(), K = (uint32_t)t.cols();
+            auto pipe = m_.pso("tile_bf16");
+            tenc->setComputePipelineState(pipe);
+            tenc->setBuffer(w_.buffer(), t.begin, 0);
+            tenc->setBuffer(wtile_, (NS::UInteger)woff_[n], 1);
+            tenc->setBytes(&N, sizeof(N), 2);
+            tenc->setBytes(&K, sizeof(K), 3);
+            tenc->dispatchThreadgroups(MTL::Size::Make((K + 127u) / 128u, N / 64u, 1),
+                                       MTL::Size::Make(256, 1, 1));
+        }
+        tenc->endEncoding();
+        m_.submit(tcb, true);
+        printf("vision: bf16 tile-major cache %.1f MB (%zu tensors)\n", used / 1e6, tiled.size());
+        // Pre-allocate the activation buffers for a typical image so the first
+        // encode does not pay the first-touch cost (grows on demand beyond this).
+        ensure(1024);
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -349,11 +412,30 @@ bool Vision::encode(const std::vector<uint16_t>& patches, const ImageInfo& info,
 
     ensure(N);
     memcpy(patches_->contents(), patches.data(), (size_t)N * (size_t)cfg_.patch_dim * 2);
+    // k/v are kept in head-major [8][pseq][64] views and the MPP attention runs
+    // over `pseq` keys (a multiple of 64); rows [N, pseq) must stay zero.
+    const uint32_t pseq = (uint32_t)(((N + 63) / 64) * 64);
+    memset(kh_->contents(), 0, (size_t)pseq * 512 * 2);
+    memset(vh_->contents(), 0, (size_t)pseq * 512 * 2);
+    constexpr uint32_t kQBlock = 1024;
 
     const uint32_t gw = (uint32_t)info.grid_w, gh = (uint32_t)info.grid_h;
     MTL::CommandBuffer* cb = m_.begin();
     MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
     const bool dbg = getenv("MIORI_VISION_DEBUG") != nullptr;
+    const bool prof = getenv("MIORI_VISION_PROFILE") != nullptr;
+    auto tprev = std::chrono::steady_clock::now();
+    auto mark = [&](const char* tag) {
+        if (!prof) return;
+        enc->endEncoding();
+        m_.submit(cb, true);
+        const auto now = std::chrono::steady_clock::now();
+        fprintf(stderr, "[prof] %-22s %7.2f ms\n", tag,
+                std::chrono::duration<double>(now - tprev).count() * 1000.0);
+        tprev = now;
+        cb = m_.begin();
+        enc = cb->computeCommandEncoder();
+    };
     auto dumpf = [&](const char* tag, MTL::Buffer* b, size_t n) {
         if (!dbg) return;
         enc->endEncoding();
@@ -371,11 +453,21 @@ bool Vision::encode(const std::vector<uint16_t>& patches, const ImageInfo& info,
         enc = cb->computeCommandEncoder();
     };
 
+    (void)0;
     auto wname = [&](int l, const char* suffix) {
         return "vision_tower.layers." + std::to_string(l) + "." + suffix;
     };
+    // Dense matmuls go through the tensor-core path whenever the operands are
+    // contiguous in the layout gemm_mpp assumes (A [M][K], C [M][N], N % 64 == 0).
+    // Attention QK/PV keep gemm_naive: they use per-head column/byte offsets and
+    // a [64][seq] "weight" layout that MPP cannot express without a repack.
     auto gemm = [&](MTL::Buffer* A, uint32_t lda, const std::string& name, MTL::Buffer* C,
                     uint32_t ldc, uint32_t m, uint32_t n, uint32_t k) {
+        auto it = woff_.find(name);
+        if (it != woff_.end() && lda == k && ldc == n && (n % 64u) == 0u && m > 0) {
+            gemm_mpp(m_, enc, A, wtile_, C, m, n, k, it->second);
+            return;
+        }
         const Tensor& t = w_.get(name);
         gemm_naive(m_, enc, A, w_.buffer(), C, m, n, k, lda, k, ldc, 0, (uint32_t)t.begin, 0);
     };
@@ -387,6 +479,7 @@ bool Vision::encode(const std::vector<uint16_t>& patches, const ImageInfo& info,
             (uint32_t)N, H, cfg_.norm_eps);
     // embedding_norm output *is* the initial residual stream
     to_f32(m_, enc, h_, x_, (uint32_t)N * H);
+    mark("patchifier+norm");
 
     for (int l = 0; l < cfg_.layers; ++l) {
         if (!kVisionKind[l]) {
@@ -415,6 +508,7 @@ bool Vision::encode(const std::vector<uint16_t>& patches, const ImageInfo& info,
             gemm(conv_b_, 1024, wname(l, "conv.out_proj.weight"), proj_, 1024, (uint32_t)N, H, H);
             add(m_, enc, x_, proj_, x_, (uint32_t)N * H);
             if (l < 2) { char tg[32]; snprintf(tg, sizeof(tg), "layer %d op", l); dumpf(tg, x_, (size_t)N * H); }
+            mark("conv op");
         } else {
             rmsnorm(m_, enc, x_, w_, w_.get(wname(l, "operator_norm.weight")), h_,
                     (uint32_t)N, H, cfg_.norm_eps);
@@ -443,52 +537,102 @@ bool Vision::encode(const std::vector<uint16_t>& patches, const ImageInfo& info,
                     enc->setBytes(&dim, sizeof(dim), 3);
                     enc->setBytes(&gw, sizeof(gw), 4);
                     enc->setBytes(&theta, sizeof(theta), 5);
-                    enc->dispatchThreads(
-                        MTL::Size::Make((size_t)N * heads * 32u, 1, 1),
-                        MTL::Size::Make(256, 1, 1));
-                }
-                {
-                    auto p = m_.pso("vision_vt");
-                    enc->setComputePipelineState(p);
-                    enc->setBuffer(vf_, 0, 0);
-                    enc->setBuffer(vt_, 0, 1);
-                    uint32_t n = (uint32_t)N, d = 512;
-                    enc->setBytes(&n, sizeof(n), 2);
-                    enc->setBytes(&d, sizeof(d), 3);
-                    enc->dispatchThreads(MTL::Size::Make((size_t)N * 512, 1, 1),
+                    enc->dispatchThreads(MTL::Size::Make((size_t)N * heads * 32u, 1, 1),
                                          MTL::Size::Make(256, 1, 1));
                 }
             }
-            // bidirectional GQA, query blocks of 128 to keep the score matrix small
-            const uint32_t seq = (uint32_t)N;
-            for (int q0 = 0; q0 < N; q0 += 128) {
-                const uint32_t mq = (uint32_t)std::min(128, N - q0);
+            // --- head-major views: one contiguous [rows][64] block per head ----
+            {
+                auto p = m_.pso("vision_to_heads");
+                enc->setComputePipelineState(p);
+                enc->setBuffer(qn_, 0, 0);
+                enc->setBuffer(qh_, 0, 1);
+                uint32_t n = (uint32_t)N, heads = (uint32_t)cfg_.heads, dstride = (uint32_t)N;
+                enc->setBytes(&n, sizeof(n), 2);
+                enc->setBytes(&heads, sizeof(heads), 3);
+                enc->setBytes(&dstride, sizeof(dstride), 4);
+                enc->dispatchThreads(MTL::Size::Make((size_t)N * 1024, 1, 1),
+                                     MTL::Size::Make(256, 1, 1));
+            }
+            {
+                auto p = m_.pso("vision_to_heads");
+                enc->setComputePipelineState(p);
+                enc->setBuffer(kn_, 0, 0);
+                enc->setBuffer(kh_, 0, 1);
+                uint32_t n = (uint32_t)N, heads = (uint32_t)cfg_.kv_heads, dstride = pseq;
+                enc->setBytes(&n, sizeof(n), 2);
+                enc->setBytes(&heads, sizeof(heads), 3);
+                enc->setBytes(&dstride, sizeof(dstride), 4);
+                enc->dispatchThreads(MTL::Size::Make((size_t)N * 512, 1, 1),
+                                     MTL::Size::Make(256, 1, 1));
+            }
+            {
+                auto p = m_.pso("vision_v_heads");
+                enc->setComputePipelineState(p);
+                enc->setBuffer(vf_, 0, 0);
+                enc->setBuffer(vh_, 0, 1);
+                uint32_t n = (uint32_t)N, dstride = pseq;
+                enc->setBytes(&n, sizeof(n), 2);
+                enc->setBytes(&dstride, sizeof(dstride), 3);
+                enc->dispatchThreads(MTL::Size::Make((size_t)N * 512, 1, 1),
+                                     MTL::Size::Make(256, 1, 1));
+            }
+            // tile each kv head into [pseq/64][64][64] for the QK matmul
+            for (uint32_t hkv = 0; hkv < (uint32_t)cfg_.kv_heads; ++hkv) {
+                auto p = m_.pso("tile_bf16");
+                enc->setComputePipelineState(p);
+                enc->setBuffer(kh_, (NS::UInteger)((size_t)hkv * pseq * 64 * 2), 0);
+                enc->setBuffer(ktile_,
+                               (NS::UInteger)((size_t)hkv * (pseq / 64) * 64 * 64 * 2), 1);
+                uint32_t nn = pseq, kk = 64;
+                enc->setBytes(&nn, sizeof(nn), 2);
+                enc->setBytes(&kk, sizeof(kk), 3);
+                enc->dispatchThreadgroups(MTL::Size::Make(1, pseq / 64, 1),
+                                          MTL::Size::Make(256, 1, 1));
+            }
+            // bidirectional GQA on tensor cores; keys are padded to a multiple of 64
+            for (int q0 = 0; q0 < N; q0 += (int)kQBlock) {
+                const uint32_t mq = (uint32_t)std::min<int>(kQBlock, N - q0);
                 for (int hh = 0; hh < cfg_.heads; ++hh) {
                     const uint32_t kvh = (uint32_t)(hh / (cfg_.heads / cfg_.kv_heads));
-                    gemm_naive(m_, enc, qn_, kn_, scores_, mq, seq, 64, 1024, 512, seq,
-                               (uint32_t)((q0 * 1024 + hh * 64) * 2),
-                               (uint32_t)(kvh * 64 * 2), 0);
+                    gemm_mpp_off(m_, enc, qh_, ktile_, scores_, mq, pseq, 64,
+                                 (uint32_t)(((size_t)hh * N + q0) * 64 * 2),
+                                 (uint32_t)((size_t)kvh * (pseq / 64) * 64 * 64 * 2), 0);
                     {
                         auto p = m_.pso("vision_softmax");
                         enc->setComputePipelineState(p);
                         enc->setBuffer(scores_, 0, 0);
                         enc->setBuffer(probs_, 0, 1);
                         float scale = 1.0f / std::sqrt(64.0f);
-                        enc->setBytes(&seq, sizeof(seq), 2);
+                        uint32_t limit = (uint32_t)N;
+                        enc->setBytes(&pseq, sizeof(pseq), 2);
                         enc->setBytes(&scale, sizeof(scale), 3);
+                        enc->setBytes(&limit, sizeof(limit), 4);
                         enc->dispatchThreadgroups(MTL::Size::Make(mq, 1, 1),
                                                   MTL::Size::Make(256, 1, 1));
                     }
-                    gemm_naive(m_, enc, probs_, vt_, attn_, mq, 64, seq, seq, seq, 1024, 0,
-                               (uint32_t)(kvh * 64 * seq * 2),
-                               (uint32_t)((q0 * 1024 + hh * 64) * 4));
+                    // MPP writes f32 into the head-major attention buffer
+                    gemm_mpp_off(m_, enc, probs_, vh_, attn_h_, mq, 64, pseq, 0,
+                                 (uint32_t)((size_t)kvh * pseq * 64 * 2),
+                                 (uint32_t)(((size_t)hh * N + q0) * 64 * 4));
                 }
             }
-            to_bf16(m_, enc, attn_, attn_b_, (uint32_t)N * H);
+            {
+                auto p = m_.pso("vision_from_heads");
+                enc->setComputePipelineState(p);
+                enc->setBuffer(attn_h_, 0, 0);
+                enc->setBuffer(attn_b_, 0, 1);
+                uint32_t n = (uint32_t)N, heads = (uint32_t)cfg_.heads;
+                enc->setBytes(&n, sizeof(n), 2);
+                enc->setBytes(&heads, sizeof(heads), 3);
+                enc->dispatchThreads(MTL::Size::Make((size_t)N * 1024, 1, 1),
+                                     MTL::Size::Make(256, 1, 1));
+            }
             gemm(attn_b_, 1024, wname(l, "self_attn.out_proj.weight"), proj_, 1024,
                  (uint32_t)N, H, H);
             add(m_, enc, x_, proj_, x_, (uint32_t)N * H);
             if (l < 2) { char tg[32]; snprintf(tg, sizeof(tg), "layer %d op", l); dumpf(tg, x_, (size_t)N * H); }
+            mark("attn op");
         }
         // pre-norm only feed-forward
         rmsnorm(m_, enc, x_, w_, w_.get(wname(l, "ffn_norm.weight")), h_,
@@ -499,6 +643,7 @@ bool Vision::encode(const std::vector<uint16_t>& patches, const ImageInfo& info,
         gemm(fact_, 2560, wname(l, "feed_forward.w2.weight"), down_, 1024, (uint32_t)N, H, 2560);
         add(m_, enc, x_, down_, x_, (uint32_t)N * H);
         if (l < 2 || l == 13) { char tg[32]; snprintf(tg, sizeof(tg), "layer %d ffn", l); dumpf(tg, x_, (size_t)N * H); }
+        mark("ffn");
     }
 
     // projector: LayerNorm -> reshape 2x2 blocks to 4096 -> linear_1 -> GELU -> linear_2
@@ -549,6 +694,7 @@ bool Vision::encode(const std::vector<uint16_t>& patches, const ImageInfo& info,
         enc->dispatchThreads(MTL::Size::Make(total, 1, 1), MTL::Size::Make(256, 1, 1));
     }
 
+    mark("projector");
     enc->endEncoding();
     m_.submit(cb, true);
 

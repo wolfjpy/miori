@@ -99,14 +99,18 @@ kernel void vision_softmax(device float* scores [[buffer(0)]],
                            device bfloat* probs [[buffer(1)]],
                            constant uint& seq [[buffer(2)]],
                            constant float& scale [[buffer(3)]],
+                           constant uint& limit [[buffer(4)]],
                            uint row [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]],
                            uint warp [[simdgroup_index_in_threadgroup]]) {
     threadgroup float part[8];
     const ulong ro = (ulong)row * seq;
+    // `seq` may be padded to a multiple of 64; keys >= limit are ignored and get
+    // probability 0 so the PV matmul over the padded columns is a no-op.
     float mx = -INFINITY;
-    for (uint s = tid; s < seq; s += 256u) mx = max(mx, scores[ro + s] * scale);
+    for (uint s = tid; s < seq; s += 256u)
+        if (s < limit) mx = max(mx, scores[ro + s] * scale);
     mx = simd_max(mx);
     if (lane == 0u) part[warp] = mx;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -121,7 +125,7 @@ kernel void vision_softmax(device float* scores [[buffer(0)]],
 
     float sum = 0.0f;
     for (uint s = tid; s < seq; s += 256u) {
-        const float e = exp(scores[ro + s] * scale - mx);
+        const float e = (s < limit) ? exp(scores[ro + s] * scale - mx) : 0.0f;
         scores[ro + s] = e;
         sum += e;
     }
@@ -175,17 +179,48 @@ kernel void vision_rope(device bfloat* x [[buffer(0)]],
     x[base + d + 32u] = bfloat(x1 * c + x0 * s);
 }
 
-// ---------------------------------------------------------------- V transpose
-// v is [n][d] bf16 -> vt is [d][n] bf16; the attention matmul needs V in
-// [output_dim][seq] layout because gemm_naive computes A[M,K] * B[N,K]^T.
-kernel void vision_vt(device const float* v [[buffer(0)]],
-                      device bfloat* vt [[buffer(1)]],
-                      constant uint& n [[buffer(2)]],
-                      constant uint& d [[buffer(3)]],
-                      uint i [[thread_position_in_grid]]) {
-    if (i >= n * d) return;
-    const uint s = i / d, c = i % d;
-    vt[(ulong)c * n + s] = bfloat(v[i]);
+// ---------------------------------------------------------------- head-major layouts
+// q/k are produced as [patches][heads*64] (one row per patch). The tensor-core
+// attention needs each head contiguous, so these two kernels move between the
+// row-major and the head-major [heads][patches][64] views. `dstride` is the row
+// count reserved per head (padded for k/v so the MPP N dimension is a multiple
+// of 64; the padding rows are pre-zeroed).
+kernel void vision_to_heads(device const bfloat* src [[buffer(0)]],
+                            device bfloat* dst [[buffer(1)]],
+                            constant uint& n [[buffer(2)]],
+                            constant uint& heads [[buffer(3)]],
+                            constant uint& dstride [[buffer(4)]],
+                            uint i [[thread_position_in_grid]]) {
+    if (i >= n * heads * 64u) return;
+    const uint p = i / (heads * 64u);
+    const uint c = i % (heads * 64u);
+    const uint h = c / 64u, d = c % 64u;
+    dst[(ulong)h * dstride * 64ul + (ulong)p * 64ul + d] = src[i];
+}
+
+kernel void vision_from_heads(device const float* src [[buffer(0)]],
+                              device bfloat* dst [[buffer(1)]],
+                              constant uint& n [[buffer(2)]],
+                              constant uint& heads [[buffer(3)]],
+                              uint i [[thread_position_in_grid]]) {
+    if (i >= n * heads * 64u) return;
+    const uint p = i / (heads * 64u);
+    const uint c = i % (heads * 64u);
+    const uint h = c / 64u, d = c % 64u;
+    dst[i] = bfloat(src[(ulong)h * n * 64ul + (ulong)p * 64ul + d]);
+}
+
+// v (f32 [patches][512]) -> per-kv-head bf16 [8][dstride][64], which is exactly
+// the one-tile [N/64][K][64] layout gemm_mpp wants for the PV matmul.
+kernel void vision_v_heads(device const float* v [[buffer(0)]],
+                           device bfloat* vh [[buffer(1)]],
+                           constant uint& n [[buffer(2)]],
+                           constant uint& dstride [[buffer(3)]],
+                           uint i [[thread_position_in_grid]]) {
+    if (i >= n * 512u) return;
+    const uint s = i / 512u, c = i % 512u;
+    const uint h = c / 64u, d = c % 64u;
+    vh[(ulong)h * dstride * 64ul + (ulong)s * 64ul + d] = bfloat(v[i]);
 }
 
 // ---------------------------------------------------------------- gated 3x3 depthwise conv
@@ -221,4 +256,30 @@ kernel void vision_conv3x3(device const float* gated [[buffer(0)]],
         }
     }
     out[i] = bcx[(ulong)p * 3u * H + H + c] * acc;
+}
+
+// ---------------------------------------------------------------- bf16 tile-major copy
+// Copies one [N, K] bf16 weight into the [N/64][K][64] layout consumed by
+// `gemm_mpp` (identical to what `dequant_tile` produces for 4-bit weights):
+// element (n, k) lands at tile n/64, row k, column n%64.
+// Requires N % 64 == 0; K may be arbitrary.
+kernel void tile_bf16(device const bfloat* src [[buffer(0)]],
+                      device bfloat* dst [[buffer(1)]],
+                      constant uint& N [[buffer(2)]],
+                      constant uint& K [[buffer(3)]],
+                      uint2 tg [[threadgroup_position_in_grid]],   // x = k block, y = n tile
+                      uint tid [[thread_index_in_threadgroup]]) {
+    const uint r = tid >> 2;          // row inside the 64-row tile
+    const uint seg = tid & 3u;        // 4 segments x 32 k values
+    const uint row = tg.y * 64u + r;
+    if (row >= N) return;
+    device const bfloat* srow = src + (ulong)row * K;
+    device bfloat* o = dst + (ulong)tg.y * (ulong)K * 64ul
+                       + (ulong)tg.x * 128ul * 64ul;
+    const uint k0 = tg.x * 128u + seg * 32u;
+    for (uint e = 0; e < 32u; ++e) {
+        const uint k = k0 + e;
+        if (k >= K) break;
+        o[(ulong)(seg * 32u + e) * 64ul + r] = srow[k];
+    }
 }

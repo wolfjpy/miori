@@ -8,6 +8,7 @@
 #include "weights.h"
 #include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace miori {
@@ -80,8 +81,11 @@ private:
     MTL::Buffer* vf_ = nullptr;        // f32  [N][512]
     MTL::Buffer* qn_ = nullptr;        // bf16 [N][1024]
     MTL::Buffer* kn_ = nullptr;        // bf16 [N][512]
-    MTL::Buffer* vt_ = nullptr;        // bf16 [512][N]
-    MTL::Buffer* attn_ = nullptr;      // f32  [N][1024]
+    MTL::Buffer* qh_ = nullptr;        // bf16 [16][N][64]   head-major q
+    MTL::Buffer* kh_ = nullptr;        // bf16 [8][pseq][64] head-major k, zero padded
+    MTL::Buffer* vh_ = nullptr;        // bf16 [8][pseq][64] head-major v, zero padded
+    MTL::Buffer* ktile_ = nullptr;     // bf16 [8][pseq/64][64][64] tiled k (per head)
+    MTL::Buffer* attn_h_ = nullptr;    // f32  [16][N][64]   head-major attention out
     MTL::Buffer* attn_b_ = nullptr;    // bf16 [N][1024]
     MTL::Buffer* proj_ = nullptr;      // f32  [N][1024]
     MTL::Buffer* bcx_ = nullptr;       // f32  [N][3072]
@@ -92,13 +96,19 @@ private:
     MTL::Buffer* fu_ = nullptr;        // f32  [N][2560]
     MTL::Buffer* fact_ = nullptr;      // bf16 [N][2560]
     MTL::Buffer* down_ = nullptr;      // f32  [N][1024]
-    MTL::Buffer* scores_ = nullptr;    // f32  [128][N]
-    MTL::Buffer* probs_ = nullptr;     // bf16 [128][N]
+    MTL::Buffer* scores_ = nullptr;    // f32  [1024][pseq]
+    MTL::Buffer* probs_ = nullptr;     // bf16 [1024][pseq]
     MTL::Buffer* ln_ = nullptr;        // bf16 [N][1024]
     MTL::Buffer* lin1_ = nullptr;      // f32  [N/4][4096]
     MTL::Buffer* gelu_ = nullptr;      // bf16 [N/4][4096]
     MTL::Buffer* lin2_ = nullptr;      // f32  [N/4][2048]
     MTL::Buffer* feat_ = nullptr;      // bf16 [N/4][2048]
+
+    // bf16 weights copied into the [N/64][K][64] tile-major layout consumed by
+    // `gemm_mpp` (tensor cores). One buffer, per-tensor byte offsets.
+    MTL::Buffer* wtile_ = nullptr;
+    uint32_t wtile_used_ = 0;
+    std::unordered_map<std::string, uint32_t> woff_;
 
     void ensure(int n_patches);
 };

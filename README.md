@@ -15,6 +15,7 @@ No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ 
 | Batch decode (fixed slots, Bmax=4) | working, CLI only |
 | Batch decode (Bmax=4) | working, server-integrated |
 | Vision tower (patchifier, 14 layers, projector) | working: `vision-run` captions photos |
+| Vision on MPP tensor cores (bf16 tile-major cache) | working: 8.2× faster than the SIMT path |
 | Vision in the HTTP API / multi-image batch | **not implemented** |
 | Paged KV / continuous batching | **not implemented** |
 | int8 KV / prefix cache / shared-prefix attention | **not implemented** |
@@ -25,8 +26,8 @@ Measured on the target M6/16GB (headless, 3-run median where applicable):
 prefill 1002 tokens: 0.372 s = 2694 tok/s
 decode 128 tokens:   1.311 s =  97.5 tok/s  (~118 GB/s effective)
 server:              OpenAI /v1/chat/completions + SSE
-vision 512x480 image: 254 ms   (960 patches -> 240 image tokens)
-vision 1024x992 image: 2.03 s  (3968 patches -> 992 image tokens)
+vision 512x480 image: 32 ms    (960 patches -> 240 image tokens, warm)
+vision 1024x992 image: 271 ms  (3968 patches -> 992 image tokens, warm)
 ```
 
 ## Build
@@ -90,6 +91,7 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ./build/miori test-tokenizer
 ./build/miori vision-test --image cat.jpg --cpu-ref       # vision vs fp32 CPU reference
 ./build/miori vision-test --image cat.jpg --text-check    # embed+prefill == token prefill (0 diff)
+./build/miori vision-test --image cat.jpg --repeat 3     # cold/warm encode latency
 ./build/miori vision-test --image cat.jpg --dump-ppm /tmp/resized.ppm  # check preprocessing
 ./build/miori bench --prefill 1024 --decode 128
 ./build/miori batch-test --prompts "The capital of France is" "List the first four primes."
@@ -106,11 +108,12 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 - No paged KV, no prefix cache, no int8 KV.
 - Vision works from the CLI only (`vision-run`, `vision-test`); the HTTP API has
   no image input yet, there is no multi-image batch and no vision feature cache.
-- Vision latency is 6.4× off the C4 gate (254 ms for 512² vs 40 ms): the tower
-  uses the SIMT bf16 `gemm_naive` (~650 GFLOPS) rather than MPP tensor cores.
-  The bf16 vision weights would have to be tiled at load for `gemm_mpp`.
-- Vision attention materialises scores per 128-query block; memory is O(128·N)
-  but compute is still O(N²), so the processor's max_pixels default is expensive.
+- Vision attention still materialises the 16 × N² score matrices (about 2 GB of
+  traffic per layer at 1024²); above ~1K patches that is the dominant cost
+  (198 ms of the 271 ms). A fused flash-style QK/softmax/PV kernel is the next
+  step; the dense GEMMs and QK/PV themselves run on tensor cores.
+- The vision tower needs a 378 MB bf16 tile-major weight cache in addition to the
+  1.59 GB safetensors mapping and the 2.93 GB text bf16 cache.
 - Prefill chunks are 128 tokens; the bf16 cache costs 2.93 GB of the 12.7 GB
   working set.
 - Greedy decoding is exact; temperature/top-k/top-p are implemented on the CPU.

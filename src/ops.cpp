@@ -322,11 +322,17 @@ void dequant_tile(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
 void gemm_mpp(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
               MTL::Buffer* B, MTL::Buffer* C, uint32_t M, uint32_t N, uint32_t K,
               uint32_t boff) {
+    gemm_mpp_off(m, e, A, B, C, M, N, K, 0, boff, 0);
+}
+
+void gemm_mpp_off(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
+                  MTL::Buffer* B, MTL::Buffer* C, uint32_t M, uint32_t N, uint32_t K,
+                  uint32_t aoff, uint32_t boff, uint32_t coff) {
     auto p = m.pso("gemm_mpp");
     e->setComputePipelineState(p);
-    e->setBuffer(A, 0, 0);
+    e->setBuffer(A, aoff, 0);
     e->setBuffer(B, boff, 1);
-    e->setBuffer(C, 0, 2);
+    e->setBuffer(C, coff, 2);
     e->setBytes(&M, sizeof(M), 3);
     e->setBytes(&N, sizeof(N), 4);
     e->setBytes(&K, sizeof(K), 5);

@@ -201,6 +201,7 @@ static int cmd_vision_test(Metal& m, Weights& w, int argc, char** argv) {
     std::string image;
     int min_pixels = 65536, max_pixels = 16777216;
     bool cpu_ref = false, text_check = false;
+    int repeat = 1;
     std::string dump;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
@@ -209,6 +210,7 @@ static int cmd_vision_test(Metal& m, Weights& w, int argc, char** argv) {
         else if (a == "--max-pixels" && i + 1 < argc) max_pixels = atoi(argv[++i]);
         else if (a == "--cpu-ref") cpu_ref = true;
         else if (a == "--text-check") text_check = true;
+        else if (a == "--repeat" && i + 1 < argc) repeat = atoi(argv[++i]);
         else if (a == "--dump-ppm" && i + 1 < argc) dump = argv[++i];
         else if (a == "--wstats") {
             tensor_stats(w, "vision_tower.patchifier.weight");
@@ -249,11 +251,15 @@ static int cmd_vision_test(Metal& m, Weights& w, int argc, char** argv) {
     if (!dump.empty()) write_ppm(dump, rgb, info.resized_w, info.resized_h);
 
     std::vector<uint16_t> feats;
-    auto t0 = std::chrono::steady_clock::now();
-    if (!vis.encode(patches, info, feats, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
-    auto t1 = std::chrono::steady_clock::now();
-    const double sec = std::chrono::duration<double>(t1 - t0).count();
-    printf("vision encode: %.1f ms\n", sec * 1000.0);
+    double sec = 0.0;
+    for (int r = 0; r < std::max(1, repeat); ++r) {
+        auto t0 = std::chrono::steady_clock::now();
+        if (!vis.encode(patches, info, feats, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        auto t1 = std::chrono::steady_clock::now();
+        sec = std::chrono::duration<double>(t1 - t0).count();
+        printf("vision encode%s: %.1f ms\n", repeat > 1 ? (r == 0 ? " (cold)" : " (warm)") : "",
+               sec * 1000.0);
+    }
     print_feature_stats(feats, info.n_tokens);
 
     if (text_check) {

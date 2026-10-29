@@ -11,7 +11,8 @@
 | MPP tensor-core prefill (bf16 cache) | 2694 tok/s @1K | `C1` |
 | 4-bit decode | 97.5 tok/s (short ctx), 94.1 tok/s (1K ctx, 16-way split-K) | `C1` |
 | OpenAI HTTP + SSE | working, serialized | `C3` |
-| Vision tower + projector + splice | working in CLI (`vision-run`); 512² = 254 ms | `C4` |
+| Vision tower + projector + splice | working in CLI (`vision-run`); 512² = 32 ms (warm) | `C4` |
+| Vision on MPP tensor cores | 8.2× vs SIMT: 261 → 32 ms (512²), 2028 → 271 ms (1024²) | `C4` |
 | Vision in HTTP API / multi-image batch | **not implemented** | `C4` |
 | Paged KV / int8 KV | **not implemented** | `C2`, `C5` |
 | Single-prefix KV cache | working in CLI and HTTP (one system slot) | `C5` |
@@ -24,8 +25,9 @@
 - M2 C2: PARTIAL (fixed-slot batch decode up to 4 sequences, token-identical on
   the batched 4-bit GEMV path; no paged KV, continuous batching or server wiring).
 - M3 C3: PARTIAL (API works; 64-concurrency gate not met).
-- M4 C4: PARTIAL — functionality GO (captions end to end, CPU cosine 0.9996);
-  latency NO-GO (512² 261 ms vs 40 ms; SIMT bf16 GEMM), no HTTP image input.
+- M4 C4: GO — captions end to end (CPU cosine 0.9997), 512² 32 ms warm vs the
+  40 ms gate, 1024² 271 ms vs 600 ms. Not wired into the HTTP API and no
+  multi-image batch; fused flash attention would remove the remaining N² traffic.
 - M5 C5: PARTIAL (single-prefix snapshot cache; no radix/int8/shared-prefix).
 - M6 C6: PARTIAL (kernel-level validation only).
 - M7 C7: PARTIAL (v0.1.0-core).

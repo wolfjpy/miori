@@ -93,6 +93,13 @@ void gemm_mpp(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
               MTL::Buffer* B, MTL::Buffer* C, uint32_t M, uint32_t N, uint32_t K,
               uint32_t boff = 0);
 
+// Same tensor-core GEMM with byte offsets into A, B and C. A must be
+// contiguous [M][K] from aoff, C contiguous [M][N] from coff, and B must be in
+// the [N/64][K][64] tile-major layout from boff. N must be a multiple of 64.
+void gemm_mpp_off(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
+                  MTL::Buffer* B, MTL::Buffer* C, uint32_t M, uint32_t N, uint32_t K,
+                  uint32_t aoff, uint32_t boff, uint32_t coff);
+
 void gemv4x4(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
              const Tensor& q, const Tensor& s, const Tensor& b,
              MTL::Buffer* x, MTL::Buffer* y, uint32_t N, uint32_t K);
