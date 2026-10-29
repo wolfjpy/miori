@@ -1,4 +1,4 @@
-# STATUS — 2026-10-29
+| C5 prefix | working (4-prefix LRU) |# STATUS — 2026-10-29
 - C2: PARTIAL — packed multi-request prefill landed (64 x 23-token prompts 2.10 s -> 0.67 s, bit-identical, server default); still no paged KV or continuous batching.
 
 ## Delivered and measured

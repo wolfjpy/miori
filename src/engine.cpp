@@ -76,8 +76,10 @@ bool Engine::init(std::string& err) {
                 const size_t kbytes = (size_t)4096 * 512 * 2;
                 kc_[l] = buf(kbytes);
                 vc_[l] = buf(kbytes);
-                snap_kc_[l] = buf(kbytes);
-                snap_vc_[l] = buf(kbytes);
+                for (int s = 0; s < kSnapshotSlots; ++s) {
+                    snap_kc_[s][l] = buf(kbytes);
+                    snap_vc_[s][l] = buf(kbytes);
+                }
                 memset(kc_[l]->contents(), 0, kbytes);
                 memset(vc_[l]->contents(), 0, kbytes);
             } else {
@@ -86,7 +88,8 @@ bool Engine::init(std::string& err) {
                     memset(cs_[l][k]->contents(), 0, (size_t)6 * 2048 * 4);
                 }
                 cs_cur_[l] = 0;
-                snap_cs_[l] = buf((size_t)6 * 2048 * 4);
+                for (int s = 0; s < kSnapshotSlots; ++s)
+                    snap_cs_[s][l] = buf((size_t)6 * 2048 * 4);
             }
             // validate all tensors used by this layer
             const std::string base = "language_model.model.layers." + std::to_string(l) + ".";
@@ -547,41 +550,42 @@ void Engine::reset() {
 }
 
 
-void Engine::snapshot() {
+void Engine::snapshot(int slot) {
+    if (slot < 0 || slot >= kSnapshotSlots) return;
     for (int l = 0; l < 24; ++l) {
         if (kLayerSuffix[l][0] == 's') {
             for (int h = 0; h < 4; ++h) {
                 const size_t off = (size_t)h * 4096 * 128 * 2;
-                memcpy((uint8_t*)snap_kc_[l]->contents() + off,
+                memcpy((uint8_t*)snap_kc_[slot][l]->contents() + off,
                        (const uint8_t*)kc_[l]->contents() + off, (size_t)pos_ * 128 * 2);
-                memcpy((uint8_t*)snap_vc_[l]->contents() + off,
+                memcpy((uint8_t*)snap_vc_[slot][l]->contents() + off,
                        (const uint8_t*)vc_[l]->contents() + off, (size_t)pos_ * 128 * 2);
             }
         } else {
-            memcpy(snap_cs_[l]->contents(), cs_[l][cs_cur_[l]]->contents(), (size_t)6 * 2048 * 4);
+            memcpy(snap_cs_[slot][l]->contents(), cs_[l][cs_cur_[l]]->contents(), (size_t)6 * 2048 * 4);
         }
     }
-    snap_pos_ = pos_;
-    has_snapshot_ = true;
+    snap_pos_[slot] = pos_;
+    has_snapshot_[slot] = true;
 }
 
-void Engine::restore() {
-    if (!has_snapshot_) return;
+void Engine::restore(int slot) {
+    if (slot < 0 || slot >= kSnapshotSlots || !has_snapshot_[slot]) return;
     for (int l = 0; l < 24; ++l) {
         if (kLayerSuffix[l][0] == 's') {
             for (int h = 0; h < 4; ++h) {
                 const size_t off = (size_t)h * 4096 * 128 * 2;
                 memcpy((uint8_t*)kc_[l]->contents() + off,
-                       (const uint8_t*)snap_kc_[l]->contents() + off, (size_t)snap_pos_ * 128 * 2);
+                       (const uint8_t*)snap_kc_[slot][l]->contents() + off, (size_t)snap_pos_[slot] * 128 * 2);
                 memcpy((uint8_t*)vc_[l]->contents() + off,
-                       (const uint8_t*)snap_vc_[l]->contents() + off, (size_t)snap_pos_ * 128 * 2);
+                       (const uint8_t*)snap_vc_[slot][l]->contents() + off, (size_t)snap_pos_[slot] * 128 * 2);
             }
         } else {
             cs_cur_[l] = 0;
-            memcpy(cs_[l][0]->contents(), snap_cs_[l]->contents(), (size_t)6 * 2048 * 4);
+            memcpy(cs_[l][0]->contents(), snap_cs_[slot][l]->contents(), (size_t)6 * 2048 * 4);
         }
     }
-    pos_ = snap_pos_;
+    pos_ = snap_pos_[slot];
 }
 
 void Engine::prefill_ids(const std::vector<int>& ids, bool need_logits) {

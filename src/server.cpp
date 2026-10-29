@@ -312,8 +312,23 @@ private:
     std::atomic<int> active_cnt_{0};
 };
 struct PrefixCache {
-    std::string system;
-    bool valid = false;
+    struct Entry { std::string system; bool valid = false; uint64_t used = 0; };
+    Entry e[Engine::kSnapshotSlots];
+    uint64_t tick = 0;
+    int find(const std::string& s) {
+        for (int i = 0; i < Engine::kSnapshotSlots; ++i)
+            if (e[i].valid && e[i].system == s) { e[i].used = ++tick; return i; }
+        return -1;
+    }
+    int claim() {
+        for (int i = 0; i < Engine::kSnapshotSlots; ++i)
+            if (!e[i].valid) { e[i].used = ++tick; return i; }
+        int lru = 0;
+        for (int i = 1; i < Engine::kSnapshotSlots; ++i)
+            if (e[i].used < e[lru].used) lru = i;
+        e[lru].used = ++tick;
+        return lru;
+    }
 };
 
 static void make_prefix(Tokenizer& t, const std::string& system, std::vector<int>& v) {
@@ -532,14 +547,16 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         make_suffix(tok, user, thinking, suffix);
         prompt_tokens = prefix.size() + suffix.size();
         std::lock_guard<std::mutex> lock(mu);
-        if (!pc.valid || pc.system != system) {
+        int slot = pc.find(system);
+        if (slot < 0) {
+            slot = pc.claim();
             eng.reset();
             eng.prefill_ids(prefix, false);
-            eng.snapshot();
-            pc.system = system;
-            pc.valid = true;
+            eng.snapshot(slot);
+            pc.e[slot].system = system;
+            pc.e[slot].valid = true;
         } else {
-            eng.restore();
+            eng.restore(slot);
         }
         out = eng.generate_from_state(suffix, cfg);
     }

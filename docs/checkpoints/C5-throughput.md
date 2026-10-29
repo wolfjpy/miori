@@ -32,3 +32,20 @@ warm: 0.042 s   (restore + suffix prefill + 1 token)
 ```
 
 ~8.4x lower latency on repeated system prompts; output is unchanged.
+
+## Multi-prefix snapshot cache (added)
+
+`Engine` now keeps 4 full-prefix snapshots (KV + conv state, ~92 MB each) instead
+of one; `snapshot(slot)` / `restore(slot)` are additive and default to slot 0, so
+`prefix-test` is unchanged.
+
+The server's single-sequence path uses a 4-entry LRU keyed by the system prompt
+string. Alternating two system prompts in `MIORI_EXACT=1` mode:
+
+```
+A cold 0.118 s, B cold 0.084 s, A warm 0.043 s, B warm 0.054 s
+```
+
+A warm request after B still hits A's snapshot; the old single-slot cache would
+have re-prefilled A. This is a multi-prefix cache, not a radix/page-sharing cache:
+each entry remains a full private 92 MB snapshot, capped at 4 (368 MB total).

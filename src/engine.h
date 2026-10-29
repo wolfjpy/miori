@@ -37,9 +37,10 @@ public:
     void prefill_embeds(const uint16_t* embeds, int T, bool need_logits);
     std::vector<int> decode_loop(const GenConfig& cfg);
     std::vector<int> generate_from_state(const std::vector<int>& suffix, const GenConfig& cfg);
-    void snapshot();
-    void restore();
-    bool has_snapshot() const { return has_snapshot_; }
+    static constexpr int kSnapshotSlots = 4;
+    void snapshot(int slot = 0);
+    void restore(int slot = 0);
+    bool has_snapshot(int slot = 0) const { return has_snapshot_[slot]; }
     MTL::Buffer* alloc_temp(size_t bytes) { return m_.new_buffer(bytes); }
     void reset();
     const float* logits() const;
@@ -118,11 +119,11 @@ private:
     MTL::Buffer* lm4s_ = nullptr;
     MTL::Buffer* lm4b_ = nullptr;
     bool lm4_ok_ = false;
-    MTL::Buffer* snap_kc_[24] = {};
-    MTL::Buffer* snap_vc_[24] = {};
-    MTL::Buffer* snap_cs_[24] = {};
-    int snap_pos_ = 0;
-    bool has_snapshot_ = false;
+    MTL::Buffer* snap_kc_[kSnapshotSlots][24] = {};
+    MTL::Buffer* snap_vc_[kSnapshotSlots][24] = {};
+    MTL::Buffer* snap_cs_[kSnapshotSlots][24] = {};
+    int snap_pos_[kSnapshotSlots] = {};
+    bool has_snapshot_[kSnapshotSlots] = {};
     std::unordered_map<std::string, uint32_t> woff_;
     uint32_t wbf_used_ = 0;
     MTL::Buffer* kc_[24] = {};
