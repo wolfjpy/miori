@@ -49,3 +49,14 @@ comes from the bf16 MPP decode GEMM vs the 4-bit GEMV of the exact path.
 server uses MPP for bursts (aggregate throughput priority) and the exact path for
 queues <4. This is a documented throughput/bit-exactness trade-off, not a
 correctness bug in the packed prefill.
+
+## Load soak (partial)
+
+16 concurrent greedy requests per round, 8 output tokens, 120 rounds:
+
+```
+1920/1920 HTTP 200, 62 s wall (~31 req/s), no crash, no 429/500
+```
+
+This is a short soak, not the 24 h C6 gate. It does exercise packed prefill,
+the 32-slot batch path, continuous admission and slot release repeatedly.
