@@ -55,3 +55,25 @@ queue exceeds 256 requests.
 `image_url` base64 (JPEG/PNG) is accepted and routed through the vision tower to
 a captioned response. Text-only requests still use the 4-slot batch scheduler;
 image requests take the single-sequence path under the Engine mutex.
+
+## Hybrid routing (added)
+
+The scheduler now picks a path per arrival pattern:
+
+- queue < 4 and no active batch: serve one request through the single Engine
+  (4-bit GEMV, exact, low latency);
+- queue >= 4: fill up to 32 slots and decode with bf16 MPP (`gemm_mpp`) +
+  bf16 lm_head.
+
+Measured (16 greedy tokens per request):
+
+```
+single:        0.271 s
+16 concurrent: 1.551 s   (~165 tok/s aggregate)
+64 concurrent: 3.492 s   (~293 tok/s aggregate; was 5.80 s on B=4)
+```
+
+Outputs on the batch path are coherent (`The capital of France is` -> `Paris.`).
+The batch path uses bf16 MPP and therefore is not token-identical to the 4-bit
+single-stream path; the single path remains exact. Prefill is still sequential
+and is now roughly half of the 64-concurrent wall time.

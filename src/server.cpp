@@ -159,6 +159,7 @@ static ImageCache g_images;
 struct Job {
     std::vector<int> prompt;
     int max_tokens = 16;
+    float temperature = 0.0f;
     std::vector<int> out;
     bool done = false;
     std::mutex m;
@@ -167,7 +168,8 @@ struct Job {
 
 class Scheduler {
 public:
-    explicit Scheduler(BatchEngine& be, std::mutex& eng_mu) : be_(be), eng_mu_(eng_mu) {}
+    explicit Scheduler(Engine& eng, BatchEngine& be, std::mutex& eng_mu)
+        : eng_(eng), be_(be), eng_mu_(eng_mu) {}
     bool submit(const std::shared_ptr<Job>& j) {
         { std::lock_guard<std::mutex> lk(mu_); if (q_.size() >= 256) return false; q_.push_back(j); }
         cv_.notify_one();
@@ -185,6 +187,26 @@ public:
                 if (!q_.empty() && active.size() < (size_t)BatchEngine::kBmax)
                     cv_.wait_for(lk, std::chrono::milliseconds(5),
                                  [&] { return q_.size() >= (size_t)BatchEngine::kBmax; });
+            }
+            // Small queue: serve one request through the low-latency single path
+            // instead of paying the 32-row MPP tile cost.
+            if (active.empty()) {
+                bool small = false;
+                { std::lock_guard<std::mutex> lk(mu_); small = q_.size() < 4; }
+                if (small) {
+                    std::shared_ptr<Job> j;
+                    { std::lock_guard<std::mutex> lk(mu_); if (!q_.empty()) { j = q_.front(); q_.pop_front(); } }
+                    if (j) {
+                        GenConfig cfg;
+                        cfg.max_tokens = j->max_tokens;
+                        cfg.temperature = j->temperature;
+                        std::vector<int> out;
+                        { std::lock_guard<std::mutex> el(eng_mu_); out = eng_.generate(j->prompt, cfg); }
+                        { std::lock_guard<std::mutex> jl(j->m); j->out = out; j->done = true; }
+                        j->cv.notify_all();
+                        continue;
+                    }
+                }
             }
             // Fill free slots from the queue.
             for (;;) {
@@ -236,6 +258,7 @@ public:
         }
     }
 private:
+    Engine& eng_;
     BatchEngine& be_;
     std::mutex& eng_mu_;
     std::mutex mu_;
@@ -434,11 +457,11 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         }
         prompt_tokens = ids.size();
     } else if (temp <= 0.01f) {
-    } else if (temp <= 0.01f) {
         // Greedy requests go through the 4-slot batch decoder.
         auto job = std::make_shared<Job>();
         job->prompt = tok.chat(system, user, thinking);
         job->max_tokens = max_tokens;
+        job->temperature = temp;
         prompt_tokens = job->prompt.size();
         if (!sched.submit(job)) {
             std::string r = "HTTP/1.1 429 Too Many Requests\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -529,8 +552,8 @@ int run_server(Metal& m, Weights& w, int port) {
         fprintf(stderr, "batch engine: %s\n", err.c_str());
         return 1;
     }
-    be.set_kernels(BatchEngine::Kernels::Gemv4);
-    Scheduler sched(be, mu);
+    be.set_kernels(BatchEngine::Kernels::MppBf16);
+    Scheduler sched(eng, be, mu);
     std::thread([&sched]() { sched.run(); }).detach();
 
     int srv = ::socket(AF_INET, SOCK_STREAM, 0);

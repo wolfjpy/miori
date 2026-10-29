@@ -216,3 +216,11 @@ A `m=32, n=64` `matmul2d` variant (2 simdgroups) for B≤32 was measured at B=32
 68.6 ms/step / 466 tok/s, worse than the 64-row tile (58.8 ms / 544 tok/s).
 The 64-row tile with 4 simdgroups is better even when M=32; the kernel is kept
 but unused. Batch default remains B=4 gemv4_b.
+
+## Server default: hybrid B=4-exact / B=32-MPP
+
+`serve` now uses kBmax=32 with MPP bf16 for bursts and the single Engine for
+small queues (<4 pending). 64 concurrent 16-token requests: 5.80 s (B=4 exact)
+-> 3.49 s. The B=32 path is coherent but not token-identical to 4-bit GEMV; the
+low-queue path is exact. Batched prefill remains the next bottleneck (~half the
+64-concurrent wall time).

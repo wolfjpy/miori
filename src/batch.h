@@ -19,7 +19,7 @@ namespace miori {
 // copied into the batch slot. Prefill itself is therefore not batched.
 class BatchEngine {
 public:
-    static constexpr int kBmax = 4;
+    static constexpr int kBmax = 32;
     static constexpr int kRows = 64;      // MPP 64-row tile granularity
     static constexpr int kHidden = 2048;
     static constexpr int kFfn = 7680;
