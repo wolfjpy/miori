@@ -11,7 +11,8 @@
 | MPP tensor-core prefill (bf16 cache) | 2694 tok/s @1K | `C1` |
 | 4-bit decode | 97.5 tok/s (short ctx), 94.1 tok/s (1K ctx, 16-way split-K) | `C1` |
 | OpenAI HTTP + SSE | working, serialized | `C3` |
-| Vision / paged KV / int8 KV / prefix cache | **not implemented** | `C2`, `C4`, `C5` |
+| Vision / paged KV / int8 KV | **not implemented** | `C2`, `C4` |
+| Single-prefix KV cache | working (CLI `prefix-test`), not wired to HTTP | `C5` |
 
 ## Milestone verdicts
 
@@ -20,7 +21,7 @@
 - M2 C2: NO-GO (no paged KV / continuous batching).
 - M3 C3: PARTIAL (API works; 64-concurrency gate not met).
 - M4 C4: NO-GO (vision tower not executed).
-- M5 C5: NO-GO.
+- M5 C5: PARTIAL (single-prefix snapshot cache; no radix/int8/shared-prefix).
 - M6 C6: PARTIAL (kernel-level validation only).
 - M7 C7: PARTIAL (v0.1.0-core).
 
