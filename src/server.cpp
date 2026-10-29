@@ -462,7 +462,9 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         return;
     }
     if (header.find("GET /v1/models") != std::string::npos) {
-        std::string b = "{\"object\":\"list\",\"data\":[{\"id\":\"lfm3-vl-2b-mlx-4bit\",\"object\":\"model\"}]}";
+        std::string b = "{\"object\":\"list\",\"data\":[{\"id\":\"lfm3-vl-2b-mlx-4bit\","
+                        "\"object\":\"model\",\"owned_by\":\"miori\",\"context_length\":4096,"
+                        "\"modalities\":[\"text\",\"image\"]}]}";
         std::string r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
                         std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
         send_all(fd, r);

@@ -173,3 +173,8 @@ warmup:    0.148 s, second 0.048 s
 `GenConfig` (previously ignored; defaults top_k=50, top_p=1.0, seed=1234).
 `max_tokens` is clamped to [1, 4096]. Verified with
 `temperature=0.8, top_p=0.5, top_k=20, seed=7` -> coherent sentence.
+
+## Model metadata
+
+`GET /v1/models` now reports `owned_by`, `context_length=4096` and
+`modalities=["text","image"]` in addition to the model id.
