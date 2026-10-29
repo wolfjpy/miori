@@ -75,3 +75,10 @@ resident: 10.22 GB -> 10.28 GB (+60 MB over the run)
 No crash, no 429/500, no monotonic growth beyond allocator noise. The steady
 footprint is ~10.3 GB, so the 16 GB machine has ~2.4 GB headroom; B=64 with
 bf16 KV (5.9 GB) would not fit without mixed/int8 KV. Still not the 24 h C6 gate.
+
+## Request latency histogram
+
+`/metrics` now exposes `miori_request_duration_seconds` (cumulative buckets
+10 ms .. 10 s + `+Inf`, count and sum), measured from the start of request
+handling to the response/stream completion. Verified with a 4-token `2+2`
+request: 1 request in the 100-250 ms bucket, sum 0.125 s.

@@ -385,6 +385,25 @@ static long resident_bytes() {
     return (long)info.phys_footprint;
 }
 
+static std::atomic<long> g_lat_count{0};
+static std::atomic<long> g_lat_sum_us{0};
+static std::atomic<long> g_lat_bucket[10];
+static const long kLatMs[10] = {10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000};
+struct ReqTimer {
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~ReqTimer() {
+        long us = (long)std::chrono::duration_cast<std::chrono::microseconds>(
+                      std::chrono::steady_clock::now() - t0).count();
+        g_lat_count.fetch_add(1);
+        g_lat_sum_us.fetch_add(us);
+        for (int i = 0; i < 10; ++i)
+            if (us <= kLatMs[i] * 1000) {
+                for (int j = i; j < 10; ++j) g_lat_bucket[j].fetch_add(1);
+                break;
+            }
+    }
+};
+
 static const bool g_exact = [] {
     const char* v = getenv("MIORI_EXACT");
     return v && atoi(v) != 0;
@@ -393,6 +412,7 @@ static std::atomic<long> g_requests{0};
 static std::atomic<long> g_tokens{0};
 
 static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCache& pc, Scheduler& sched, Vision* vis) {
+    ReqTimer req_timer;
     std::string body;
     std::string header = read_request(fd, body);
     if (header.empty()) { ::close(fd); return; }
@@ -411,7 +431,17 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
                         "miori_image_cache_entries " + std::to_string(g_images.size()) + "\n"
                         "# HELP miori_resident_bytes Resident memory\n"
                         "# TYPE miori_resident_bytes gauge\n"
-                        "miori_resident_bytes " + std::to_string(resident_bytes()) + "\n";
+                        "miori_resident_bytes " + std::to_string(resident_bytes()) + "\n"
+                        "# HELP miori_request_duration_seconds Request duration\n"
+                        "# TYPE miori_request_duration_seconds histogram\n";
+        for (int i = 0; i < 10; ++i)
+            b += "miori_request_duration_seconds_bucket{le=\"" + std::to_string(kLatMs[i] / 1000.0) +
+                 "\"} " + std::to_string(g_lat_bucket[i].load()) + "\n";
+        b += "miori_request_duration_seconds_bucket{le=\"+Inf\"} " +
+             std::to_string(g_lat_count.load()) + "\n";
+        b += "miori_request_duration_seconds_count " + std::to_string(g_lat_count.load()) + "\n";
+        b += "miori_request_duration_seconds_sum " +
+             std::to_string(g_lat_sum_us.load() / 1e6) + "\n";
         std::string r = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
                         std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
         send_all(fd, r);
