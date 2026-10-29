@@ -270,7 +270,7 @@ kernel void conv7(device const float* gated [[buffer(0)]],
                   device const bfloat* w [[buffer(2)]],      // [H,7]
                   device const float* state [[buffer(3)]],    // [6,H]
                   device float* state_out [[buffer(4)]],      // [6,H]
-                  device float* y [[buffer(5)]],
+                  device bfloat* y [[buffer(5)]],
                   constant uint& T [[buffer(6)]],
                   constant uint& H [[buffer(7)]],
                   uint i [[thread_position_in_grid]]) {
@@ -285,7 +285,7 @@ kernel void conv7(device const float* gated [[buffer(0)]],
         else v = gated[(ulong)pos * H + c];
         acc = fma(v, float(w[c * 7u + k]), acc);
     }
-    y[(ulong)t * H + c] = bcx[(ulong)t * 3u * H + H + c] * acc;
+    y[(ulong)t * H + c] = bfloat(bcx[(ulong)t * 3u * H + H + c] * acc);
 
     // Shift the 6-token window: last 6 of (old_state ++ gated[0..T-1]).
     if (t == 0) {

@@ -253,9 +253,8 @@ void Engine::conv_layer(int layer, int pos) {
     int cur = cs_cur_[layer];
     conv7(m_, e_, gated_, bcx_, w_, w_.get("language_model.model.layers." +
                                           std::to_string(layer) + ".conv.conv.weight"),
-          cs_[layer][cur], cs_[layer][1 - cur], conv_y_, 1, 2048);
+          cs_[layer][cur], cs_[layer][1 - cur], h_, 1, 2048);
     cs_cur_[layer] = 1 - cur;
-    to_bf16(m_, e_, conv_y_, h_, 2048);
     qw(layer, "conv.out_proj", oq, os, ob, on, ok);
     gemv4(m_, e_, w_, *oq, *os, *ob, h_, proj_, on, ok);
     post_norm_add(layer, "post_operator_norm.weight", proj_);
@@ -347,9 +346,8 @@ void Engine::p_conv(int layer, int T) {
     int cur = cs_cur_[layer];
     conv7(m_, e_, pgated_, pbcx_, w_, w_.get("language_model.model.layers." +
                                              std::to_string(layer) + ".conv.conv.weight"),
-          cs_[layer][cur], cs_[layer][1 - cur], pconv_y_, T, 2048);
+          cs_[layer][cur], cs_[layer][1 - cur], ph_, T, 2048);
     cs_cur_[layer] = 1 - cur;
-    to_bf16(m_, e_, pconv_y_, ph_, T * 2048);
     qw(layer, "conv.out_proj", oq, os, ob, on, ok);
     p_gemm(ph_, 2048, *oq, *os, *ob, on, ok, pproj_, 2048, T);
     p_post(layer, "post_operator_norm.weight", pproj_, T);
