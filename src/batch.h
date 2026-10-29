@@ -240,6 +240,8 @@ private:
     MTL::CommandBuffer* cb_ = nullptr;
     MTL::ComputeCommandEncoder* e_ = nullptr;
     Kernels kernels_ = Kernels::MppBf16;
+    bool use_gemv_ = false;
+    int step_b_ = kBmax;
     Slot slots_[kBmax];
     int steps_ = 0;
     double total_decode_s_ = 0.0;

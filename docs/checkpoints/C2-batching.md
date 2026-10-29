@@ -399,3 +399,27 @@ time was 2.02 s, the same as B=32: packed prefill needs two passes at
 `kPackRows=1024` (64x23 = 1484 tokens), and the one-wave decode only cancels
 that. KV grows to 5.9 GB (32 slots = 2.95 GB). Reverted to kBmax=32; B=64 is
 available as a compile-time experiment, not the server default.
+
+## Dynamic M in batch decode (added)
+
+`decode_step` now uses M = (highest active slot + 1) for the MPP GEMMs instead of
+always 64 rows, and when all active slots are < 4 it switches to the exact
+4-bit `gemv4_b`/`gemv8_b` path with B=4 (no MPP drift for small batches).
+
+`batch-test`, 16 tokens:
+
+| B | before | now |
+|---|---:|---:|
+| 4 | 58.8 ms/step | **19.6 ms/step (exact gemv)** |
+| 32 | 58.8 ms/step (544 tok/s) | **46.8 ms/step (684 tok/s)** |
+
+HTTP, 16 tokens per request:
+
+| concurrency | before | now |
+|---|---:|---:|
+| 4 | 0.68 s | **0.29 s** (exact 4-bit) |
+| 16 | 1.55 s | **1.00 s** |
+| 64 | 1.98–2.11 s | **1.94 s** |
+
+`batch-test --kernels gemv4` is usable again (exact for ≤4 low slots, MPP
+fallback above).

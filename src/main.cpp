@@ -1167,10 +1167,6 @@ int main(int argc, char** argv) {
                 }
             }
         }
-        if (kernels == BatchEngine::Kernels::Gemv4 && BatchEngine::kBmax > 4) {
-            fprintf(stderr, "batch-test: --kernels gemv4 requires kBmax<=4; use --kernels mpp\n");
-            return 2;
-        }
         if (prompts.empty())
             prompts = {"The capital of France is", "List the first four primes."};
         if (prompts.size() < 2) prompts.push_back("What is 2+2?");

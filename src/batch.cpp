@@ -190,25 +190,25 @@ bool BatchEngine::load_weights(std::string& err) {
 }
 
 void BatchEngine::linear(MTL::Buffer* A, MTL::Buffer* C, const Proj& p) {
-    if (kernels_ == Kernels::Gemv4) {
-        gemv4_b(m_, e_, w_, *p.wt, *p.sc, *p.bi, A, C, p.N, p.K, (uint32_t)kBmax);
+    if (use_gemv_) {
+        gemv4_b(m_, e_, w_, *p.wt, *p.sc, *p.bi, A, C, p.N, p.K, (uint32_t)step_b_);
     } else {
-        gemm_mpp(m_, e_, A, eng_.bf16_buffer(), C, kRows, p.N, p.K, p.off);
+        gemm_mpp(m_, e_, A, eng_.bf16_buffer(), C, (uint32_t)step_b_, p.N, p.K, p.off);
     }
 }
 
 void BatchEngine::linear_gate(MTL::Buffer* A, MTL::Buffer* C, const Proj& p) {
-    if (kernels_ == Kernels::Gemv4) {
-        gemv4_b(m_, e_, w_, *p.wt, *p.sc, *p.bi, A, C, p.N, p.K, (uint32_t)kBmax);
+    if (use_gemv_) {
+        gemv4_b(m_, e_, w_, *p.wt, *p.sc, *p.bi, A, C, p.N, p.K, (uint32_t)step_b_);
     } else {
         // N = 16 is not a multiple of 64: the cache holds this tensor row-major.
-        gemm_naive(m_, e_, A, eng_.bf16_buffer(), C, kRows, p.N, p.K, kHidden, p.K, p.N,
+        gemm_naive(m_, e_, A, eng_.bf16_buffer(), C, (uint32_t)step_b_, p.N, p.K, kHidden, p.K, p.N,
                    0, p.off, 0);
     }
 }
 
 void BatchEngine::ffn(int layer) {
-    const uint32_t B = (uint32_t)kBmax;
+    const uint32_t B = (uint32_t)step_b_;
     rmsnorm(m_, e_, xb_, w_, *norm_ffn_[layer], hb_, B, kHidden, 1e-5f);
     linear(hb_, fgb_, lw_[layer].w1);
     linear(hb_, fub_, lw_[layer].w3);
@@ -218,7 +218,7 @@ void BatchEngine::ffn(int layer) {
 }
 
 void BatchEngine::attn_layer(int layer) {
-    const uint32_t B = (uint32_t)kBmax;
+    const uint32_t B = (uint32_t)step_b_;
     rmsnorm(m_, e_, xb_, w_, *norm_op_[layer], hb_, B, kHidden, 1e-5f);
     linear(hb_, qb_, lw_[layer].q);
     linear(hb_, kb_, lw_[layer].k);
@@ -240,7 +240,7 @@ void BatchEngine::attn_layer(int layer) {
 }
 
 void BatchEngine::conv_layer(int layer) {
-    const uint32_t B = (uint32_t)kBmax;
+    const uint32_t B = (uint32_t)step_b_;
     rmsnorm(m_, e_, xb_, w_, *norm_op_[layer], hb_, B, kHidden, 1e-5f);
     linear(hb_, bcxb_, lw_[layer].in);
     conv_gate(m_, e_, bcxb_, gatedb_, B, kHidden);
@@ -596,31 +596,28 @@ int BatchEngine::decode_step() {
         }
     }
     if (!nrun) return 0;
+    bool low_slots = true;
+    for (int s = 4; s < kBmax; ++s)
+        if (slots_[s].active && !slots_[s].finished) low_slots = false;
+    use_gemv_ = low_slots && nrun <= 4;
+    step_b_ = use_gemv_ ? 4 : kBmax;
 
     const auto t0 = std::chrono::steady_clock::now();
     cb_ = m_.begin();
     e_ = cb_->computeCommandEncoder();
-    embed8(m_, e_, w_, *emb_q_, *emb_s_, *emb_b_, tokb_, embb_, kBmax, kHidden);
-    to_f32(m_, e_, embb_, xb_, kBmax * kHidden);
+    embed8(m_, e_, w_, *emb_q_, *emb_s_, *emb_b_, tokb_, embb_, step_b_, kHidden);
+    to_f32(m_, e_, embb_, xb_, step_b_ * kHidden);
     for (int l = 0; l < kLayers; ++l) {
         if (Engine::is_attention_layer(l)) attn_layer(l);
         else conv_layer(l);
     }
-    rmsnorm(m_, e_, xb_, w_, *norm_emb_, hlastb_, kBmax, kHidden, 1e-5f);
-    if (kernels_ == Kernels::Gemv4) {
-        // One pass over the 8-bit embedding matrix for every slot.
+    rmsnorm(m_, e_, xb_, w_, *norm_emb_, hlastb_, step_b_, kHidden, 1e-5f);
+    if (use_gemv_) {
         gemv8_b(m_, e_, w_, *emb_q_, *emb_s_, *emb_b_, hlastb_, logitsb_, kVocab,
-                kHidden, (uint32_t)kBmax);
-    } else if (kBmax > 4) {
-        gemm_naive(m_, e_, hlastb_, embb16_, logitsb_, kBmax, kVocab, kHidden,
-                   kHidden, kHidden, kVocab);
+                kHidden, (uint32_t)step_b_);
     } else {
-        for (int s = 0; s < kBmax; ++s) {
-            if (!slots_[s].active || slots_[s].finished) continue;
-            gemv8_off(m_, e_, w_.buffer(), (uint32_t)emb_q_->begin, (uint32_t)emb_s_->begin,
-                      (uint32_t)emb_b_->begin, hlastb_, logitsb_, kVocab, kHidden,
-                      (uint32_t)s * kHidden * 2, (uint32_t)s * kVocab * 4);
-        }
+        gemm_naive(m_, e_, hlastb_, embb16_, logitsb_, step_b_, kVocab, kHidden,
+                   kHidden, kHidden, kVocab);
     }
     e_->endEncoding();
     m_.submit(cb_, true);

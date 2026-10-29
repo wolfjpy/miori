@@ -33,7 +33,9 @@ tile-major cache and MPP `matmul2d` (64-row tiles), 128-token chunks.
 
 - `batch-prefill-test --n 64`: 2.095 s sequential → 0.664 s packed (3.15x,
   2234 tok/s prefill, 10.4 ms/request).
-- B=32 bf16 MPP decode: 544 tok/s aggregate (58.8 ms/step) in `batch-test`.
+- B=32 bf16 MPP decode: **684 tok/s aggregate (46.8 ms/step)** after dynamic-M.
+- B=4 exact batch: **19.6 ms/step** via the exact gemv path (0.29 s for 4
+  concurrent HTTP, 16 tokens).
 - B=4 exact 4-bit batch: 261 tok/s aggregate (15.3 ms/step, token-identical).
 - Small queues (<4) are served by the single-sequence exact path.
 

@@ -97,3 +97,14 @@ sequential path (first-token logits, KV, conv state).
 `MIORI_EXACT=1` disables the batch/MPP path and serves every greedy request
 through the single Engine (4-bit GEMV + prefix cache). This is token-exact but
 serial; default remains hybrid for aggregate throughput.
+
+## Dynamic-M batch decode
+
+Batch decode uses M = highest active slot + 1 and falls back to exact 4-bit GEMV
+when ≤4 low slots are active. 16 greedy tokens:
+
+```
+4 concurrent:  0.291 s (exact 4-bit)
+16 concurrent: 0.996 s
+64 concurrent: 1.94 s
+```
