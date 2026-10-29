@@ -140,6 +140,7 @@ public:
         n_tokens = it->second.second;
         return true;
     }
+    size_t size() { std::lock_guard<std::mutex> lk(mu_); return map_.size(); }
     void put(uint64_t key, const std::vector<uint16_t>& feats, int n_tokens) {
         std::lock_guard<std::mutex> lk(mu_);
         if (map_.size() >= 32) {
@@ -288,7 +289,10 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
                         "miori_output_tokens_total " + std::to_string(g_tokens.load()) + "\n"
                         "# HELP miori_queue_depth Queued requests\n"
                         "# TYPE miori_queue_depth gauge\n"
-                        "miori_queue_depth " + std::to_string(sched.depth()) + "\n";
+                        "miori_queue_depth " + std::to_string(sched.depth()) + "\n"
+                        "# HELP miori_image_cache_entries Cached image feature sets\n"
+                        "# TYPE miori_image_cache_entries gauge\n"
+                        "miori_image_cache_entries " + std::to_string(g_images.size()) + "\n";
         std::string r = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
                         std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
         send_all(fd, r);

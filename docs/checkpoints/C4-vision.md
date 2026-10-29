@@ -195,3 +195,5 @@ second request: 0.534 s  (vision encode skipped)
 
 Both return the same caption. Cache is in-memory only, capped at 32 images
 (~128 MB at 992 tokens), and does not persist across server restarts.
+
+`/metrics` now exposes `miori_image_cache_entries` (currently 32-entry LRU).

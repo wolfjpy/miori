@@ -567,4 +567,18 @@ void dequant8(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
     e->dispatchThreads(MTL::Size::Make(total, 1, 1), MTL::Size::Make(256, 1, 1));
 }
 
+void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
+                MTL::Buffer* B, MTL::Buffer* C, uint32_t M, uint32_t N, uint32_t K,
+                uint32_t boff) {
+    auto p = m.pso("gemm_mpp32");
+    e->setComputePipelineState(p);
+    e->setBuffer(A, 0, 0);
+    e->setBuffer(B, boff, 1);
+    e->setBuffer(C, 0, 2);
+    e->setBytes(&M, sizeof(M), 3);
+    e->setBytes(&N, sizeof(N), 4);
+    e->setBytes(&K, sizeof(K), 5);
+    e->dispatchThreadgroups(MTL::Size::Make(N / 64, (M + 31) / 32, 1), MTL::Size::Make(64, 1, 1));
+}
+
 }  // namespace miori

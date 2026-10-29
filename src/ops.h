@@ -172,4 +172,8 @@ void dequant8(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
               const Tensor& q, const Tensor& s, const Tensor& b,
               MTL::Buffer* out, uint32_t N, uint32_t K);
 
+void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
+                MTL::Buffer* B, MTL::Buffer* C, uint32_t M, uint32_t N, uint32_t K,
+                uint32_t boff = 0);
+
 }  // namespace miori

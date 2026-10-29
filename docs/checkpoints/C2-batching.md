@@ -209,3 +209,10 @@ costs ~59 ms/token (~17 tok/s). A hybrid "small queue → single path, large que
 batch" router made 64-concurrency worse (11.8 s vs 3.7 s) because arrivals kept
 seeing a small backlog and serialized through the single path. It was reverted;
 the server default remains **B=4, 4-bit gemv4_b, token-exact**.
+
+### Negative result: 32-row MPP tile
+
+A `m=32, n=64` `matmul2d` variant (2 simdgroups) for B≤32 was measured at B=32:
+68.6 ms/step / 466 tok/s, worse than the 64-row tile (58.8 ms / 544 tok/s).
+The 64-row tile with 4 simdgroups is better even when M=32; the kernel is kept
+but unused. Batch default remains B=4 gemv4_b.

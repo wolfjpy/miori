@@ -52,3 +52,22 @@ kernel void gemm_mpp(device bfloat* A [[buffer(0)]],
         B + (ulong)tgid.x * (ulong)K * 64ul, dextents<int32_t, 2>(64, int(K)));
     op.run(mA, tB, mC);
 }
+
+// 32-row M tile for small batch sizes (B <= 32); same B tile layout as gemm_mpp.
+kernel void gemm_mpp32(device bfloat* A [[buffer(0)]],
+                       device bfloat* B [[buffer(1)]],
+                       device float* C [[buffer(2)]],
+                       constant uint& M [[buffer(3)]],
+                       constant uint& N [[buffer(4)]],
+                       constant uint& K [[buffer(5)]],
+                       uint2 tgid [[threadgroup_position_in_grid]]) {
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA(A, dextents<int32_t, 2>(int(K), int(M)));
+    tensor<device float, dextents<int32_t, 2>, tensor_inline> tC(C, dextents<int32_t, 2>(int(N), int(M)));
+    constexpr auto desc = matmul2d_descriptor(32, 64, static_cast<int>(dynamic_extent));
+    matmul2d<desc, execution_simdgroups<2>> op;
+    auto mA = tA.slice(0, int(tgid.y) * 32);
+    auto mC = tC.slice(int(tgid.x) * 64, int(tgid.y) * 32);
+    tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tB(
+        B + (ulong)tgid.x * (ulong)K * 64ul, dextents<int32_t, 2>(64, int(K)));
+    op.run(mA, tB, mC);
+}
