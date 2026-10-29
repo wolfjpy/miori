@@ -142,3 +142,14 @@ temperature 0.7, 8 tokens -> 10 SSE events, text
 Engine (4-bit GEMV + prefix cache) even when the process default is the batch
 path; it composes with `stream:true`. Verified: `What is 2+2?` with
 `exact:true` -> `4`.
+
+## Health endpoint
+
+`GET /health` now reports runtime mode, e.g.:
+
+```
+{"status":"ok","version":"0.3.0","kv":"bf16","batch_slots":32,"exact":false}
+```
+
+`kv` reflects `MIORI_KV_MIX`/`MIORI_KV_INT8`; `exact` reflects the process-level
+`MIORI_EXACT`.

@@ -407,7 +407,12 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         return;
     }
     if (header.find("GET /health") != std::string::npos) {
-        std::string b = "{\"status\":\"ok\"}";
+        const char* mix = getenv("MIORI_KV_MIX");
+        const char* i8 = getenv("MIORI_KV_INT8");
+        std::string kv = mix ? std::string("mixed-") + mix : (i8 && atoi(i8) ? "int8" : "bf16");
+        std::string b = "{\"status\":\"ok\",\"version\":\"0.3.0\",\"kv\":\"" + kv +
+                        "\",\"batch_slots\":" + std::to_string(BatchEngine::kBmax) +
+                        ",\"exact\":" + (g_exact ? "true" : "false") + "}";
         std::string r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
                         std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
         send_all(fd, r);
