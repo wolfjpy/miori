@@ -385,3 +385,17 @@ logits diff, KV/conv state diff and wall times. `--words` uses ~29-token
 question prompts instead of the default ~23-token single-word turns.
 `MIORI_BATCH_KEEP_LOGITS=1` (set by the test itself) keeps each request's
 first-token logits across packed passes so they can be diffed.
+
+### B=64 experiment
+
+`kBmax=64`, MPP decode, 64 duplicate prompts x16 tokens in `batch-test`:
+
+```
+83.5 ms/step, 766 tok/s aggregate (7.9x single)
+```
+
+So batch decode scales to 64 slots. But on the 64-concurrent HTTP test the wall
+time was 2.02 s, the same as B=32: packed prefill needs two passes at
+`kPackRows=1024` (64x23 = 1484 tokens), and the one-wave decode only cancels
+that. KV grows to 5.9 GB (32 slots = 2.95 GB). Reverted to kBmax=32; B=64 is
+available as a compile-time experiment, not the server default.
