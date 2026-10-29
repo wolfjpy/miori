@@ -1,4 +1,5 @@
-| Multi-image request | working, sequential vision per image |
+| Vision feature cache | working, 32-entry LRU |
+| Ragged vision batch / queue | **not implemented** || Multi-image request | working, sequential vision per image |
 | Ragged vision batch / queue / feature cache | **not implemented** || Multi-image request | working (sequential vision per image) | `C4` |
 | Ragged vision batch / queue / feature cache | **not implemented** | `C4` |# Miori
 

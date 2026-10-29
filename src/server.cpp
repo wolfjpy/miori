@@ -15,6 +15,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <unordered_map>
 #include <memory>
 #include <cstdio>
 #include <cstring>
@@ -129,6 +130,31 @@ static std::vector<int> image_prompt(const Tokenizer& t, const std::string& syst
     if (!thinking) ids.push_back(124902);
     return ids;
 }
+class ImageCache {
+public:
+    bool get(uint64_t key, std::vector<uint16_t>& feats, int& n_tokens) {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = map_.find(key);
+        if (it == map_.end()) return false;
+        feats = it->second.first;
+        n_tokens = it->second.second;
+        return true;
+    }
+    void put(uint64_t key, const std::vector<uint16_t>& feats, int n_tokens) {
+        std::lock_guard<std::mutex> lk(mu_);
+        if (map_.size() >= 32) {
+            map_.erase(lru_.front());
+            lru_.pop_front();
+        }
+        map_[key] = {feats, n_tokens};
+        lru_.push_back(key);
+    }
+private:
+    std::mutex mu_;
+    std::unordered_map<uint64_t, std::pair<std::vector<uint16_t>, int>> map_;
+    std::deque<uint64_t> lru_;
+};
+static ImageCache g_images;
 struct Job {
     std::vector<int> prompt;
     int max_tokens = 16;
@@ -340,6 +366,14 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
             const size_t comma = url.find(',');
             std::string b64 = comma == std::string::npos ? url : url.substr(comma + 1);
             std::string bytes = b64decode(b64);
+            const uint64_t key = std::hash<std::string>{}(bytes) ^ ((uint64_t)bytes.size() << 32);
+            std::vector<uint16_t> f;
+            int nt = 0;
+            if (g_images.get(key, f, nt)) {
+                counts.push_back(nt);
+                feats.insert(feats.end(), f.begin(), f.end());
+                continue;
+            }
             char path[] = "/tmp/miori_imgXXXXXX";
             int fdt = mkstemp(path);
             if (fdt < 0 || bytes.empty()) {
@@ -348,7 +382,7 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
             }
             (void)::write(fdt, bytes.data(), bytes.size());
             ::close(fdt);
-            std::vector<uint16_t> patches, f;
+            std::vector<uint16_t> patches;
             ImageInfo info;
             std::string ierr;
             bool ok = preprocess_image(path, 65536, 1048576, patches, info, ierr);
@@ -359,6 +393,7 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
                 std::string r = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                 send_all(fd, r); ::close(fd); return;
             }
+            g_images.put(key, f, info.n_tokens);
             counts.push_back(info.n_tokens);
             feats.insert(feats.end(), f.begin(), f.end());
         }

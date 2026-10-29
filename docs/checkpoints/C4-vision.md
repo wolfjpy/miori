@@ -179,3 +179,19 @@ seagull's head against a blue sky" (prompt_tokens 1998).
 
 Limitations: images are encoded sequentially (no ragged tower batch, no vision
 queue or feature cache), fixed max_pixels in the server, video out of scope.
+
+## Image feature cache (added)
+
+Server-side LRU (32 entries, keyed by 64-bit hash of the decoded bytes + size)
+stores projected `[n_tokens][2048]` features. Repeated images skip preprocessing
+and the vision tower entirely.
+
+Cat image, `max_pixels=1048576` (992 image tokens), 16 output tokens:
+
+```
+first request:  0.964 s
+second request: 0.534 s  (vision encode skipped)
+```
+
+Both return the same caption. Cache is in-memory only, capped at 32 images
+(~128 MB at 992 tokens), and does not persist across server restarts.
