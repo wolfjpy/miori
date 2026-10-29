@@ -1,4 +1,4 @@
-# Regression matrix (v0.3.1)
+# Regression matrix (v0.3.2)
 
 Machine: Apple M6, 16 GB, macOS 27.0.1, Xcode 27.1.
 Build: `make clean && make -j` -> 0 warnings, `build/miori` + `build/miori.metallib`.
@@ -24,7 +24,7 @@ float reference, not a kernel error (`state err = 0`).
 | check | result |
 |---|---|
 | `run --raw "The capital of France is"` | `Paris. The capital` |
-| `bench --prefill 1024 --decode 32` | 2772 tok/s prefill, 94.5 tok/s decode |
+| `bench --prefill 1024 --decode 32` | 2897 tok/s prefill, **100.4 tok/s decode** |
 | `ppl --file docs/README.md --tokens 128` | 94.785 (bf16) |
 | `prefix-test` | cold/warm `4`, snapshot works |
 
@@ -43,7 +43,7 @@ float reference, not a kernel error (`state err = 0`).
 
 | check | result |
 |---|---|
-| `vision-test --max-pixels 262144` | 240 tokens, finite features |
+| `vision-test --max-pixels 262144` | 240 tokens, finite features; steady 33-35 ms (first warm 41) |
 | `vision-run` cat | `The image shows a close-up of an...` |
 | image SSE | per-token deltas |
 
@@ -55,3 +55,12 @@ float reference, not a kernel error (`state err = 0`).
   only `MIORI_KV_MIX=vk` passes the 4-domain aggregate gate. All KV modes are
   opt-in; bf16 is the default.
 - C2 64x2K target remains NO-GO (see BENCHMARKS).
+
+## v0.3.2 additions
+
+- Startup warmup (Engine + BatchEngine), `MIORI_NO_WARMUP=1` disables.
+- Prompt >=4096 returns 400; single decode stops at 4095.
+- Reused 16 MB image embedding buffer; 100-image resident stable at 10.82 GB.
+- `/metrics`: resident bytes, request latency histogram.
+- `batch-sparse-test` (sparse slot 1/3 reuse) PASS.
+- Clean build: 0 warnings.

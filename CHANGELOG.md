@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.3.2
+
+- Startup warmup for Engine + BatchEngine (`MIORI_NO_WARMUP=1` to disable).
+- 4K prompt/decode guards (400 for prompts >=4096, stop at position 4095).
+- Reused 16 MB image embedding buffer; image-path resident high-water verified
+  stable across 100 requests (10.82 GB).
+- `/metrics`: resident bytes and request latency histogram.
+- `batch-sparse-test` for sparse slot reuse.
+- Docs refreshed to the v0.3.2 state; clean build has zero warnings.
+
 ## v0.3.1
 
 - Remove unused private fields; clean build has zero warnings.
