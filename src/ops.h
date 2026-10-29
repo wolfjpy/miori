@@ -208,10 +208,12 @@ void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
 
 // ---- optional symmetric int8 KV cache (MIORI_KV_INT8=1) --------------------
 //
-// K: int8 [h][max_seq][128], ks: bf16 [h][max_seq]
-// V: int8 [h][128][max_seq], vs: bf16 [h][max_seq]
-// One bf16 scale per (kv_head, token), max_abs/127, no zero point. The bf16
-// kernels above are untouched; callers pick one set or the other.
+// K: int8 [h][max_seq][128], ks: bf16 [h][max_seq][4]
+// V: int8 [h][128][max_seq], vs: bf16 [h][4][max_seq]
+// One bf16 scale per (kv_head, token, 32-wide d group), max_abs(group)/127, no
+// zero point. The bf16 kernels above are untouched; callers pick one set or
+// the other. Four groups cover the 128-element head, so V's [4][max_seq]
+// per-head block and K's [max_seq][4] block have the same byte size.
 
 void kv_append_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
                   MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
@@ -235,8 +237,8 @@ void attn_decode_split_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* 
                           uint32_t splits);
 
 // Prefill attention with K/V dequantised on the fly:
-//   QK: C[M][N] = A[M][K] * B[N][K]^T, B int8 scaled per row (key position).
-//   PV: C[M][N] = A[M][K] * B[N][K]^T, B int8 scaled per column (key position).
+//   QK: C[M][N] = A[M][K] * B[N][K]^T, B int8 scaled per (row N, 32-wide K group).
+//   PV: C[M][N] = A[M][K] * B[N][K]^T, B int8 scaled per (32-wide N group, column K).
 // Byte offsets select the head / slot slice, exactly like gemm_naive.
 void gemm_naive_qk_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
                       MTL::Buffer* B, MTL::Buffer* bs, MTL::Buffer* C, uint32_t M,

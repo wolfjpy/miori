@@ -778,20 +778,12 @@ kernel void dequant8(device const uint4* q [[buffer(0)]],
 
 // ============================================================ int8 KV cache
 //
-// Optional (MIORI_KV_INT8=1) symmetric int8 KV. Layouts mirror the bf16 ones:
-//   K: [h][pos][d]  int8,  scale ks[h][pos] bf16 = max_abs_over_d / 127
-//   V: [h][d][pos]  int8,  scale vs[h][pos] bf16 = max_abs_over_d / 127
-// The scale is per (kv_head, token); there is no zero point. The quantisers use
-// one threadgroup of 128 threads per (head, token): one value per thread, a
-// threadgroup max reduction, then the store. Readers multiply by the bf16 scale
-// on load; no separate dequantise pass is needed.
-
-static inline float kv_absmax(threadgroup float* sh, float v, uint lane, uint warp) {
-    v = simd_max(v);
-    if (lane == 0u) sh[warp] = v;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    return max(max(sh[0], sh[1]), max(sh[2], sh[3]));
-}
+// Optional (MIORI_KV_INT8=1) symmetric int8 KV with 32-element group scales.
+//   K: [h][pos][d] int8, ks[h][pos][g] bf16, g = d/32, scale = max_abs(group)/127
+//   V: [h][d][pos] int8, vs[h][g][pos] bf16, g = d/32, scale = max_abs(group)/127
+// One threadgroup of 128 threads per (head, token); warp w covers d-group w, so
+// the scale reduction is one simd_max and no cross-warp reduction is needed.
+// Readers multiply each element by its group's bf16 scale on load.
 
 // Append one decode token: one threadgroup per kv head.
 kernel void kv_append_i8(device const bfloat* k [[buffer(0)]],
@@ -808,20 +800,20 @@ kernel void kv_append_i8(device const bfloat* k [[buffer(0)]],
                          uint warp [[simdgroup_index_in_threadgroup]]) {
     const uint h = tg;
     const uint d = tid;
+    const uint g = warp;                      // d / 32
     const float kv = float(k[h * 128u + d]);
     const float vv = v[h * 128u + d];
-    threadgroup float mk[4], mv[4];
-    const float kmax = kv_absmax(mk, fabs(kv), lane, warp);
-    const float vmax = kv_absmax(mv, fabs(vv), lane, warp);
+    const float kmax = simd_max(fabs(kv));
+    const float vmax = simd_max(fabs(vv));
     const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
     const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
     const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
     const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
     kc[((ulong)h * max_seq + pos) * 128u + d] = (char)kq;
     vc[((ulong)h * 128u + d) * max_seq + pos] = (char)vq;
-    if (tid == 0u) {
-        ks[h * max_seq + pos] = bfloat(kscale);
-        vs[h * max_seq + pos] = bfloat(vscale);
+    if (lane == 0u) {
+        ks[((ulong)h * max_seq + pos) * 4u + g] = bfloat(kscale);
+        vs[((ulong)h * 4u + g) * max_seq + pos] = bfloat(vscale);
     }
 }
 
@@ -840,26 +832,28 @@ kernel void kv_write_b_i8(device const bfloat* k [[buffer(0)]],
                           uint warp [[simdgroup_index_in_threadgroup]]) {
     const uint t = tg / 4u, h = tg % 4u;
     const uint d = tid;
-    const ulong src = (ulong)t * 512u + h * 128u + d;
+    const uint g = warp;
     const uint pos = start + t;
-    const float kv = float(k[(ulong)t * 512u + h * 128u + d]);
+    const ulong src = (ulong)t * 512u + h * 128u + d;
+    const float kv = float(k[src]);
     const float vv = v[src];
-    threadgroup float mk[4], mv[4];
-    const float kmax = kv_absmax(mk, fabs(kv), lane, warp);
-    const float vmax = kv_absmax(mv, fabs(vv), lane, warp);
+    const float kmax = simd_max(fabs(kv));
+    const float vmax = simd_max(fabs(vv));
     const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
     const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
     const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
     const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
     kc[((ulong)h * max_seq + pos) * 128u + d] = (char)kq;
     vc[((ulong)h * 128u + d) * max_seq + pos] = (char)vq;
-    if (tid == 0u) {
-        ks[h * max_seq + pos] = bfloat(kscale);
-        vs[h * max_seq + pos] = bfloat(vscale);
+    if (lane == 0u) {
+        ks[((ulong)h * max_seq + pos) * 4u + g] = bfloat(kscale);
+        vs[((ulong)h * 4u + g) * max_seq + pos] = bfloat(vscale);
     }
 }
 
 // ---------------------------------------------------------------- int8 decode attention
+// lane d0=lane*4; its four dimensions always fall in the same 32-wide group
+// (g = lane/8), so one scale load per key covers the whole lane.
 kernel void attn_decode_i8(device const bfloat* q [[buffer(0)]],
                            device const char* kc [[buffer(1)]],
                            device const char* vc [[buffer(2)]],
@@ -876,6 +870,7 @@ kernel void attn_decode_i8(device const bfloat* q [[buffer(0)]],
     const uint warp = tid / 32u, lane = tid % 32u;
     const uint qh = h * 4u + warp;
     const uint d0 = lane * 4u;
+    const uint g = lane / 8u;
     float q0 = float(q[qh * 128u + d0 + 0u]);
     float q1 = float(q[qh * 128u + d0 + 1u]);
     float q2 = float(q[qh * 128u + d0 + 2u]);
@@ -885,15 +880,17 @@ kernel void attn_decode_i8(device const bfloat* q [[buffer(0)]],
     const uint start = (window && keys > window) ? keys - window : 0u;
     for (uint t = start; t < keys; ++t) {
         const ulong kb = ((ulong)h * max_seq + t) * 128u + d0;
-        const float ksc = float(ks[h * max_seq + t]);
+        const float ksc = float(ks[((ulong)h * max_seq + t) * 4u + g]);
         float s = q0 * float(kc[kb + 0u]) + q1 * float(kc[kb + 1u]) +
                   q2 * float(kc[kb + 2u]) + q3 * float(kc[kb + 3u]);
-        s = simd_sum(s) * ksc * 0.08838834764831845f;
+        // Group scales differ per lane: scale the partial dot before the
+        // cross-lane reduction (the all-one-scale version could scale after).
+        s = simd_sum(s * ksc) * 0.08838834764831845f;
         const float nm = max(m, s);
         const float alpha = exp(m - nm);
         const float p = exp(s - nm);
         l = l * alpha + p;
-        const float vsc = float(vs[h * max_seq + t]);
+        const float vsc = float(vs[((ulong)h * 4u + g) * max_seq + t]);
         const ulong vb = ((ulong)h * 128u + d0) * max_seq + t;
         a0 = a0 * alpha + p * float(vc[vb + 0ul * max_seq]) * vsc;
         a1 = a1 * alpha + p * float(vc[vb + 1ul * max_seq]) * vsc;
@@ -927,6 +924,7 @@ kernel void attn_decode_split_i8(device const bfloat* q [[buffer(0)]],
     const uint warp = tid / 32u, lane = tid % 32u;
     const uint qh = h * 4u + warp;
     const uint d0 = lane * 4u;
+    const uint g = lane / 8u;
     const uint keys = pos + 1u;
     const uint chunk = (keys + splits - 1u) / splits;
     const uint a = sp * chunk;
@@ -938,15 +936,17 @@ kernel void attn_decode_split_i8(device const bfloat* q [[buffer(0)]],
     float m = -INFINITY, l = 0.0f, a0 = 0, a1 = 0, a2 = 0, a3 = 0;
     for (uint t = a; t < b; ++t) {
         const ulong kb = ((ulong)h * max_seq + t) * 128u + d0;
-        const float ksc = float(ks[h * max_seq + t]);
+        const float ksc = float(ks[((ulong)h * max_seq + t) * 4u + g]);
         float s = q0 * float(kc[kb + 0u]) + q1 * float(kc[kb + 1u]) +
                   q2 * float(kc[kb + 2u]) + q3 * float(kc[kb + 3u]);
-        s = simd_sum(s) * ksc * 0.08838834764831845f;
+        // Group scales differ per lane: scale the partial dot before the
+        // cross-lane reduction (the all-one-scale version could scale after).
+        s = simd_sum(s * ksc) * 0.08838834764831845f;
         const float nm = max(m, s);
         const float alpha = exp(m - nm);
         const float p = exp(s - nm);
         l = l * alpha + p;
-        const float vsc = float(vs[h * max_seq + t]);
+        const float vsc = float(vs[((ulong)h * 4u + g) * max_seq + t]);
         const ulong vb = ((ulong)h * 128u + d0) * max_seq + t;
         a0 = a0 * alpha + p * float(vc[vb + 0ul * max_seq]) * vsc;
         a1 = a1 * alpha + p * float(vc[vb + 1ul * max_seq]) * vsc;
@@ -965,7 +965,9 @@ kernel void attn_decode_split_i8(device const bfloat* q [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------- int8 prefill GEMMs
-// Same tiling as gemm_naive. QK: B is int8 [N][K] with a bf16 scale per row N.
+// Same tiling as gemm_naive. QK: B is int8 [N][K] with a bf16 scale per
+// (row N, 32-wide K group). PV: B is int8 [N][K] with a bf16 scale per
+// (32-wide N group, column K). Both index the per-head scale array.
 kernel void gemm_naive_qk_i8(device const bfloat* A [[buffer(0)]],
                              device const char* B [[buffer(1)]],
                              device const bfloat* bs [[buffer(2)]],
@@ -982,6 +984,7 @@ kernel void gemm_naive_qk_i8(device const bfloat* A [[buffer(0)]],
     threadgroup float Bs[64][17];
     const uint tx = tid.x, ty = tid.y;
     const uint m0 = tgid.y * 64u, n0 = tgid.x * 64u;
+    const uint ng = (K + 31u) >> 5;
     float acc[4][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
     for (uint k0 = 0; k0 < K; k0 += 16u) {
         #pragma unroll
@@ -990,7 +993,8 @@ kernel void gemm_naive_qk_i8(device const bfloat* A [[buffer(0)]],
             const uint k = k0 + tx;
             As[ty * 4u + r][tx] = (m < M && k < K) ? float(A[(ulong)m * lda + k]) : 0.0f;
             const uint n = n0 + ty * 4u + r;
-            const float scale = (n < N) ? float(bs[n]) : 0.0f;
+            const uint g = (k < K ? k : K - 1u) >> 5;
+            const float scale = (n < N && k < K) ? float(bs[n * ng + g]) : 0.0f;
             Bs[ty * 4u + r][tx] =
                 (n < N && k < K) ? float(B[(ulong)n * ldb + k]) * scale : 0.0f;
         }
@@ -1021,7 +1025,6 @@ kernel void gemm_naive_qk_i8(device const bfloat* A [[buffer(0)]],
     }
 }
 
-// PV: B is int8 [N][K] with a bf16 scale per column K (per key position).
 kernel void gemm_naive_pv_i8(device const bfloat* A [[buffer(0)]],
                              device const char* B [[buffer(1)]],
                              device const bfloat* bs [[buffer(2)]],
@@ -1046,7 +1049,9 @@ kernel void gemm_naive_pv_i8(device const bfloat* A [[buffer(0)]],
             const uint k = k0 + tx;
             As[ty * 4u + r][tx] = (m < M && k < K) ? float(A[(ulong)m * lda + k]) : 0.0f;
             const uint n = n0 + ty * 4u + r;
-            const float scale = (k < K) ? float(bs[k]) : 0.0f;
+            const uint g = n >> 5;
+            const float scale =
+                (n < N && k < K) ? float(bs[g * ldb + k]) : 0.0f;
             Bs[ty * 4u + r][tx] =
                 (n < N && k < K) ? float(B[(ulong)n * ldb + k]) * scale : 0.0f;
         }

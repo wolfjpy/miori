@@ -57,20 +57,21 @@ to the token path (`max |Δlogit| = 0`).
 Symmetric int8 K/V with one bf16 scale per `(kv_head, token)`; bf16 stays the
 default. Measured 2026-10-29 (`docs/checkpoints/C5-int8-kv.md`).
 
-| item | bf16 | int8 |
+| item | bf16 | int8 (per-32 group scales) |
 |---|---:|---:|
-| Engine KV / sequence | 92.27 MB | 46.86 MB |
-| BatchEngine KV, Bmax=32 | 2952.8 MB | 1499.5 MB |
-| attention KV read / token @4K | 369.1 MB | 184.5 MB |
-| decode 4K (128 tok) | 88.3 tok/s | 87.9 tok/s |
-| prefill 4K | 1636 tok/s | 1622 tok/s |
-| decode 1K | 92.1 tok/s | 92.2 tok/s |
-| PPL `docs/README.md` (1885 pos) | 19.7301 | 19.7691 (+0.20 %) |
-| top-1 agreement, 4-domain 1K | — | 99.12 % (PPL +0.31 %) |
+| Engine KV / sequence | 92.27 MB | 49.02 MB |
+| BatchEngine KV, Bmax=32 | 2952.8 MB | 1568.7 MB |
+| attention KV payload / token @4K | 369.1 MB | 184.5 MB (+2.9 MB scales) |
+| decode 4K (128 tok) | 87.5 tok/s | 87.6 tok/s |
+| prefill 4K | 1630 tok/s | 1620 tok/s |
+| decode 1K | 91.8 tok/s | 91.8 tok/s |
+| PPL `docs/README.md` (1885 pos) | 19.7301 | 19.7364 (+0.032 %) |
+| 4-domain 1K PPL / top-1 / mean KL | — | −0.067 % / 99.34 % / 2.2e-4 |
 
 No decode speedup: single-stream decode at 4K is not KV-bandwidth-bound. The
-gain is capacity (1.45 GB less batch KV). The strict 99.5 % top-1 project gate
-is not met, so the flag remains off by default.
+gain is capacity (1.38 GB less batch KV). The strict 99.5 % top-1 project gate
+is still not met, so the flag remains off by default; see
+`docs/checkpoints/C5-int8-kv-groups.md`.
 
 ## Caches
 
@@ -93,9 +94,9 @@ is not met, so the flag remains off by default.
 - 64×2K / 64×4K aggregate target (2.5K output tok/s) is not met.
 - Vision is one image at a time in the tower; multi-image requests encode
   sequentially. No ragged vision batch or vision queue.
-- int8 KV is implemented but opt-in and misses the 99.5 % top-1 gate
-  (99.12 % aggregate, PPL +0.31 %, mean KL 3.4e-4); radix prefix cache and
-  shared-prefix attention are not implemented.
+- int8 KV is implemented (per-32 group scales) but opt-in and misses the
+  99.5 % top-1 gate (99.34 % aggregate, PPL −0.07 %, mean KL 2.2e-4); radix
+  prefix cache and shared-prefix attention are not implemented.
 - Server batch path uses bf16 MPP; over 8 prompts x 32 tokens it agrees with
   the exact 4-bit path on 89.1% of tokens. `MIORI_EXACT=1` forces the exact
   single-sequence path.

@@ -208,7 +208,8 @@ bool Engine::alloc_bf16_kv(std::string& err) {
 bool Engine::alloc_int8_kv(std::string& err) {
     try {
         const size_t k8 = (size_t)kKvHeads * kMaxSeq * kHeadDim;   // 2 MiB / layer
-        const size_t s8 = (size_t)kKvHeads * kMaxSeq * 2;          // 32 KiB / layer
+        // one bf16 scale per (head, token, 32-wide d group): [4][4096][4]
+        const size_t s8 = (size_t)kKvHeads * kMaxSeq * 4 * 2;      // 128 KiB / layer
         for (int l = 0; l < 24; ++l) {
             if (!is_attention_layer(l) || kc8_[l]) continue;
             kc8_[l] = m_.new_buffer(k8);
@@ -483,7 +484,9 @@ void Engine::p_attn(int layer, int T, int start) {
             // K/V stay int8; the GEMM multiplies each element by its bf16
             // per-token scale on load.
             const uint32_t kbase8 = (uint32_t)kMaxSeq * kHeadDim;   // bytes / head
-            const uint32_t sbase8 = (uint32_t)kMaxSeq * 2;          // bytes / head
+            // K scales are [pos][4] and V scales are [4][pos]; both occupy
+            // max_seq * 4 * 2 bytes per head.
+            const uint32_t sbase8 = (uint32_t)kMaxSeq * 4u * 2u;    // bytes / head
             gemm_naive_qk_i8(m_, e_, pqn_, kc8_[layer], ks8_[layer], scores_, T, seq, 128,
                              2048, 128, seq, h * 128 * 2, kvh * kbase8, kvh * sbase8, 0);
             softmax_prefill(m_, e_, scores_, scores_bf_, T, seq, (uint32_t)start,
@@ -696,20 +699,26 @@ void Engine::snapshot(int slot) {
             if (kv_i8_) {
                 const size_t kb = (size_t)pos_ * kHeadDim;
                 const size_t sb = (size_t)pos_ * 2;
+                const size_t skb = (size_t)pos_ * 4 * 2;   // K scales [pos][4]
                 for (int h = 0; h < kKvHeads; ++h) {
                     const size_t off = (size_t)h * kMaxSeq * kHeadDim;
-                    const size_t soff = (size_t)h * kMaxSeq;
                     if (kb) {
                         memcpy((uint8_t*)snap_kc8_[slot][l]->contents() + off,
                                (const uint8_t*)kc8_[l]->contents() + off, kb);
                         memcpy((uint8_t*)snap_vc8_[slot][l]->contents() + off,
                                (const uint8_t*)vc8_[l]->contents() + off, kb);
                     }
-                    if (sb) {
-                        memcpy((uint8_t*)snap_ks8_[slot][l]->contents() + soff * 2,
-                               (const uint8_t*)ks8_[l]->contents() + soff * 2, sb);
-                        memcpy((uint8_t*)snap_vs8_[slot][l]->contents() + soff * 2,
-                               (const uint8_t*)vs8_[l]->contents() + soff * 2, sb);
+                    const size_t ksoff = (size_t)h * kMaxSeq * 4 * 2;
+                    if (skb) {
+                        memcpy((uint8_t*)snap_ks8_[slot][l]->contents() + ksoff,
+                               (const uint8_t*)ks8_[l]->contents() + ksoff, skb);
+                    }
+                    for (int g = 0; g < 4; ++g) {
+                        const size_t vsoff = ((size_t)h * 4 + g) * kMaxSeq * 2;
+                        if (sb) {
+                            memcpy((uint8_t*)snap_vs8_[slot][l]->contents() + vsoff,
+                                   (const uint8_t*)vs8_[l]->contents() + vsoff, sb);
+                        }
                     }
                 }
             } else {
@@ -736,20 +745,27 @@ void Engine::restore(int slot) {
             if (kv_i8_) {
                 const size_t kb = (size_t)snap_pos_[slot] * kHeadDim;
                 const size_t sb = (size_t)snap_pos_[slot] * 2;
+                const size_t skb = (size_t)snap_pos_[slot] * 4 * 2;
                 for (int h = 0; h < kKvHeads; ++h) {
                     const size_t off = (size_t)h * kMaxSeq * kHeadDim;
-                    const size_t soff = (size_t)h * kMaxSeq;
                     if (kb) {
                         memcpy((uint8_t*)kc8_[l]->contents() + off,
                                (const uint8_t*)snap_kc8_[slot][l]->contents() + off, kb);
                         memcpy((uint8_t*)vc8_[l]->contents() + off,
                                (const uint8_t*)snap_vc8_[slot][l]->contents() + off, kb);
                     }
-                    if (sb) {
-                        memcpy((uint8_t*)ks8_[l]->contents() + soff * 2,
-                               (const uint8_t*)snap_ks8_[slot][l]->contents() + soff * 2, sb);
-                        memcpy((uint8_t*)vs8_[l]->contents() + soff * 2,
-                               (const uint8_t*)snap_vs8_[slot][l]->contents() + soff * 2, sb);
+                    const size_t ksoff = (size_t)h * kMaxSeq * 4 * 2;
+                    if (skb) {
+                        memcpy((uint8_t*)ks8_[l]->contents() + ksoff,
+                               (const uint8_t*)snap_ks8_[slot][l]->contents() + ksoff, skb);
+                    }
+                    for (int g = 0; g < 4; ++g) {
+                        const size_t vsoff = ((size_t)h * 4 + g) * kMaxSeq * 2;
+                        if (sb) {
+                            memcpy((uint8_t*)vs8_[l]->contents() + vsoff,
+                                   (const uint8_t*)snap_vs8_[slot][l]->contents() + vsoff,
+                                   sb);
+                        }
                     }
                 }
             } else {

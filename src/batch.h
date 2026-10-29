@@ -192,8 +192,8 @@ private:
     MTL::Buffer* vc_[kLayers] = {};   // [B][4][128][4096] bf16
     MTL::Buffer* kc8_[kLayers] = {};  // [B][4][4096][128] int8
     MTL::Buffer* vc8_[kLayers] = {};  // [B][4][128][4096] int8
-    MTL::Buffer* ks8_[kLayers] = {};  // [B][4][4096] bf16 scales
-    MTL::Buffer* vs8_[kLayers] = {};  // [B][4][4096] bf16 scales
+    MTL::Buffer* ks8_[kLayers] = {};  // [B][4][4096][4] bf16 group scales
+    MTL::Buffer* vs8_[kLayers] = {};  // [B][4][4][4096] bf16 group scales
     bool kv_i8_ = false;
     MTL::Buffer* cs_[kLayers] = {};   // [B][2][6][2048] f32
     int cs_cur_[kLayers] = {};

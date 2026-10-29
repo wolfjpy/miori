@@ -64,8 +64,8 @@ public:
     size_t kv_cache_bytes() const;
     MTL::Buffer* kv_k8(int layer) const;       // int8 [4][4096][128], null if bf16
     MTL::Buffer* kv_v8(int layer) const;       // int8 [4][128][4096], null if bf16
-    MTL::Buffer* kv_ks(int layer) const;       // bf16 [4][4096]
-    MTL::Buffer* kv_vs(int layer) const;       // bf16 [4][4096]
+    MTL::Buffer* kv_ks(int layer) const;       // bf16 [4][4096][4] group scales
+    MTL::Buffer* kv_vs(int layer) const;       // bf16 [4][4][4096] group scales
 
     // ---- additive accessors for the C2 batch path -------------------------
     // The single-sequence API above is unchanged; these only expose the state

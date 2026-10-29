@@ -1,0 +1,9 @@
+[prefill 664 tok 0.256s 2589.4 tok/s | decode 2 tok 0.011s 181.5 tok/s]
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 49.0 MB (int8 + per-head/token bf16 scales)
+prefix=647 suffix=17
+cold: 0.268 s  cached restore+gen: 0.053 s (snapshot 0.253 s)
+cold out: 4
+warm out: 4

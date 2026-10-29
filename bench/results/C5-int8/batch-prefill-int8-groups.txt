@@ -1,0 +1,26 @@
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 49.0 MB (int8 + per-head/token bf16 scales)
+batch: Bmax=32, slot KV 1568.7 MB total (int8), conv state 40.9 MB, logits 16.4 MB
+batch: packed prefill rows=1024 (175.4 MB activations), chunk=128
+
+batch-prefill-test: 8 prompts, 23..23 tokens (mean 23.0, total 184), 1 wave(s) of <= 32, 1 repetition(s)
+sequential Engine::prefill_ids : 0.259 s median (min 0.259 max 0.259) = 711 tok/s
+packed BatchEngine::add_batch  : 0.073 s median (min 0.073 max 0.073) = 2514 tok/s
+prefill speedup: 3.53x (32.33 -> 9.15 ms per request)
+first tokens: 8/8 identical
+first-token logits: 0/1024000 elements differ, max |diff| = 0
+
+state check (packed KV/conv state vs sequential Engine):
+short prompt 0: 23 tokens, KV 0/275264 bytes differ, conv 0/638976 bytes differ
+short prompt 1: 23 tokens, KV 0/275264 bytes differ, conv 0/638976 bytes differ
+
+long prompt: 431 tokens + 23-token prompt in one add_batch call: 157.4 ms
+  first tokens: 2/2 identical, logits 0/256000 differ (2 packed request(s)), max |diff| 0
+  state check:
+long+short prompt 0: 431 tokens, KV 0/5158208 bytes differ, conv 0/638976 bytes differ
+long+short prompt 1: 23 tokens, KV 0/275264 bytes differ, conv 0/638976 bytes differ
+
+state check: 4/4 requests byte-identical (KV + conv state)
+RESULT: packed prefill is bit-identical to the sequential path (first-token logits, KV, conv state) and 3.53x faster

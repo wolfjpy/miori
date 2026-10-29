@@ -84,7 +84,8 @@ bool BatchEngine::init(std::string& err) {
 
         const size_t slot_kv = (size_t)kKvHeads * kMaxSeq * kHeadDim * 2;  // 4 MB
         const size_t slot_kv8 = (size_t)kKvHeads * kMaxSeq * kHeadDim;     // 2 MB
-        const size_t slot_scale = (size_t)kKvHeads * kMaxSeq;              // bf16 each
+        // K scales [h][pos][4], V scales [h][4][pos]: 4 bf16 per (head, token)
+        const size_t slot_scale = (size_t)kKvHeads * kMaxSeq * 4;          // bf16 each
         kv_i8_ = eng_.kv_int8();
         for (int l = 0; l < kLayers; ++l) {
             if (Engine::is_attention_layer(l)) {
@@ -327,20 +328,23 @@ int BatchEngine::add_sequence(const std::vector<int>& prompt, int max_new_tokens
             uint8_t* dv = (uint8_t*)vc8_[l]->contents();
             uint8_t* ds = (uint8_t*)ks8_[l]->contents();
             uint8_t* dvs = (uint8_t*)vs8_[l]->contents();
+            const size_t skb = (size_t)pos * 4 * 2;   // K scales [pos][4]
             for (int h = 0; h < kKvHeads; ++h) {
+                const size_t head = (size_t)slot * kKvHeads + h;
                 const size_t src_h = (size_t)h * kMaxSeq * kHeadDim;
-                const size_t dst_h = ((size_t)slot * kKvHeads + h) * kMaxSeq * kHeadDim;
+                const size_t dst_h = head * kMaxSeq * kHeadDim;
                 if (kb) memcpy(dk + dst_h, sk + src_h, kb);
-                const size_t src_s = (size_t)h * kMaxSeq * 2;
-                const size_t dst_s = ((size_t)slot * kKvHeads + h) * kMaxSeq * 2;
-                if (sb) {
-                    memcpy(ds + dst_s, ss + src_s, sb);
-                    memcpy(dvs + dst_s, svs + src_s, sb);
+                const size_t src_ks = (size_t)h * kMaxSeq * 4 * 2;
+                const size_t dst_ks = head * kMaxSeq * 4 * 2;
+                if (skb) memcpy(ds + dst_ks, ss + src_ks, skb);
+                for (int g = 0; g < 4; ++g) {
+                    const size_t src_vs = ((size_t)h * 4 + g) * kMaxSeq * 2;
+                    const size_t dst_vs = (head * 4 + g) * kMaxSeq * 2;
+                    if (sb) memcpy(dvs + dst_vs, svs + src_vs, sb);
                 }
                 for (int d = 0; d < kHeadDim; ++d) {
                     const size_t src_r = ((size_t)h * kHeadDim + d) * kMaxSeq;
-                    const size_t dst_r = (((size_t)slot * kKvHeads + h) * kHeadDim + d) *
-                                         kMaxSeq;
+                    const size_t dst_r = (head * kHeadDim + d) * kMaxSeq;
                     if (vb) memcpy(dv + dst_r, sv + src_r, vb);
                 }
             }
@@ -461,8 +465,10 @@ void BatchEngine::packed_attn(int layer, const std::vector<std::vector<int>>& pr
                 if (kv_i8_) {
                     const uint32_t hbase =
                         (uint32_t)(slot * kKvHeads + kvh) * kMaxSeq * kHeadDim;  // bytes
+                    // K scales [pos][4], V scales [4][pos]: both are
+                    // max_seq * 4 * 2 bytes per head.
                     const uint32_t sbase =
-                        (uint32_t)(slot * kKvHeads + kvh) * kMaxSeq * 2u;
+                        (uint32_t)(slot * kKvHeads + kvh) * kMaxSeq * 4u * 2u;
                     gemm_naive_qk_i8(m_, e_, pqnb_, kc8_[layer], ks8_[layer], pscores_,
                                      (uint32_t)clen, seq, 128, kHidden, kHeadDim, seq,
                                      (row0 * kHidden + h * kHeadDim) * 2u, hbase, sbase, 0);

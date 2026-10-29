@@ -19,7 +19,7 @@ No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ 
 | Vision in the HTTP API | working, one base64 image per request |
 | Multi-image batch / vision queue | **not implemented** |
 | Paged KV / continuous batching | **not implemented** |
-| int8 KV (opt-in) | working behind `MIORI_KV_INT8=1`: Engine + BatchEngine, decode/prefill/snapshot; KV bytes halved (2.95 GB → 1.50 GB at Bmax=32); PPL +0.31 %, top-1 99.12 % (misses the 99.5 % strict gate, so bf16 is default) |
+| int8 KV (opt-in) | working behind `MIORI_KV_INT8=1`: Engine + BatchEngine, decode/prefill/snapshot, per-32 group scales; KV bytes 53.1 % (2.95 GB → 1.57 GB at Bmax=32); PPL −0.07 %, top-1 99.34 % (misses the 99.5 % strict gate, so bf16 is default) |
 | Shared-prefix attention / radix cache | **not implemented** |
 
 Measured on the target M6/16GB (headless, 3-run median where applicable):
@@ -114,9 +114,10 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   pass (`MIORI_BATCH_PREFILL` in the server, on by default; set `=0` to disable); longer prompts
   fall back to the sequential prefill. See `docs/checkpoints/C2-batching.md`.
 - No paged KV and no shared-prefix/radix cache (only 4 full-prefix snapshots).
-  The optional int8 KV (`MIORI_KV_INT8=1`) halves KV memory but misses the
-  project's 99.5 % top-1 gate (99.12 % aggregate, PPL +0.31 %), so bf16 is the
-  default; see `docs/checkpoints/C5-int8-kv.md`.
+  The optional int8 KV (`MIORI_KV_INT8=1`, per-32 group scales) cuts KV memory
+  to 53.1 % but misses the project's 99.5 % top-1 gate (99.34 % aggregate,
+  PPL −0.07 %, mean KL 2.2e-4), so bf16 is the default; see
+  `docs/checkpoints/C5-int8-kv-groups.md`.
 - Vision works from the CLI only (`vision-run`, `vision-test`); the HTTP API has
   no image input yet, there is no multi-image batch and no vision feature cache.
 - Vision attention still materialises the 16 × N² score matrices (about 2 GB of
