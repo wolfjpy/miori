@@ -123,3 +123,20 @@ resident: 10.82 GB (identical after 20 and after 100 requests)
 So the +0.6 GB seen in the mixed soak is one-time high-water from touching the
 vision/Engine image buffers and Metal command buffers, not a per-request leak.
 Text-only steady state remains ~10.28 GB; image-capable steady state ~10.82 GB.
+
+## 15-minute soak with memory trend (added)
+
+16 concurrent greedy text requests, one cached cat-image request every 100
+rounds, 900 s:
+
+```
+rounds: 1710 (27,360 HTTP requests), all HTTP 200
+resident samples: 85 (every 20 rounds, numeric)
+resident: min 10.27 GB, max 10.85 GB, mean 10.81 GB
+first 20 samples: 10.69 GB, last 20: 10.85 GB
+last samples: 10.8536 GB (identical across the final minutes)
+```
+
+The footprint rises once to the image-capable high-water (~10.85 GB) and then
+plateaus; no monotonic growth across 27k requests. This is 15 minutes, not the
+24 h C6 gate, but it is the longest run so far.
