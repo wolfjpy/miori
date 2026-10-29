@@ -622,7 +622,7 @@ int main(int argc, char** argv) {
         MTL::Buffer* bb = m.new_buffer(T * 3 * H * 4);
         MTL::Buffer* sb = m.new_buffer(6 * H * 4);
         MTL::Buffer* so = m.new_buffer(6 * H * 4);
-        MTL::Buffer* yb = m.new_buffer(T * H * 4);
+        MTL::Buffer* yb = m.new_buffer(T * H * 2);
         float* gp = (float*)gb->contents();
         float* bp = (float*)bb->contents();
         float* sp = (float*)sb->contents();
@@ -636,7 +636,7 @@ int main(int argc, char** argv) {
         conv7(m, e, gb, bb, w, kt, sb, so, yb, T, H);
         e->endEncoding();
         m.submit(cb, true);
-        const float* y = (const float*)yb->contents();
+        const uint16_t* y = (const uint16_t*)yb->contents();
         const float* so_p = (const float*)so->contents();
         double maxerr = 0;
         for (uint32_t t = 0; t < T; ++t) {
@@ -648,7 +648,7 @@ int main(int argc, char** argv) {
                     acc += v * bf16_to_float(wp[c * 7 + k]);
                 }
                 float ref = bp[t * 3 * H + H + c] * acc;
-                maxerr = std::max(maxerr, (double)fabsf(ref - y[t * H + c]));
+                maxerr = std::max(maxerr, (double)fabsf(ref - bf16_to_float(y[t * H + c])));
             }
         }
         double serr = 0;

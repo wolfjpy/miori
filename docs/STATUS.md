@@ -24,8 +24,8 @@
 - M2 C2: PARTIAL (fixed-slot batch decode up to 4 sequences, token-identical on
   the batched 4-bit GEMV path; no paged KV, continuous batching or server wiring).
 - M3 C3: PARTIAL (API works; 64-concurrency gate not met).
-- M4 C4: GO for functionality / NO-GO for latency (captions work end to end;
-  512² vision encode 254 ms vs 40 ms gate, SIMT bf16 GEMM instead of MPP).
+- M4 C4: PARTIAL — functionality GO (captions end to end, CPU cosine 0.9996);
+  latency NO-GO (512² 261 ms vs 40 ms; SIMT bf16 GEMM), no HTTP image input.
 - M5 C5: PARTIAL (single-prefix snapshot cache; no radix/int8/shared-prefix).
 - M6 C6: PARTIAL (kernel-level validation only).
 - M7 C7: PARTIAL (v0.1.0-core).
