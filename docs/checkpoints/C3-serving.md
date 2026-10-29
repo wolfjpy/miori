@@ -120,9 +120,10 @@ Verified with 4 concurrent stream requests: the concatenated `delta.content`
 reconstructs the full answer exactly, and 8 concurrent stream requests complete
 in 0.78 s with 16 tokens each.
 
-Limitations: the small-queue single path, `MIORI_EXACT=1`, image requests and
-temperature sampling still emit SSE after generation (one or more chunks), not
-per token; only the batch path is token-streamed.
+All main paths now stream per token: batch (per decode step), single
+(`MIORI_EXACT=1`, temperature sampling) and image requests (`decode_loop_stream`
+after `prefill_embeds`). The image stream test produced 10 events for 8 tokens
+and the partial text `The image shows a close-up of an`.
 
 ### Single-path streaming (added)
 

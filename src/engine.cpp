@@ -616,6 +616,22 @@ std::vector<int> Engine::generate_from_state(const std::vector<int>& suffix, con
     return decode_loop(cfg);
 }
 
+std::vector<int> Engine::decode_loop_stream(const GenConfig& cfg, const std::function<void(int)>& cb) {
+    std::vector<int> out;
+    if (pos_ == 0) return out;
+    int tok = sample(cfg);
+    out.push_back(tok);
+    if (cb) cb(tok);
+    for (int t = 1; t < cfg.max_tokens; ++t) {
+        if (tok == 124900) break;
+        forward(tok, pos_, true);
+        tok = sample(cfg);
+        out.push_back(tok);
+        if (cb) cb(tok);
+    }
+    return out;
+}
+
 std::vector<int> Engine::generate_from_state_stream(const std::vector<int>& suffix,
                                                     const GenConfig& cfg,
                                                     const std::function<void(int)>& cb) {

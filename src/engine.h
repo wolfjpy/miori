@@ -40,6 +40,7 @@ public:
     std::vector<int> generate_from_state(const std::vector<int>& suffix, const GenConfig& cfg);
     std::vector<int> generate_from_state_stream(const std::vector<int>& suffix, const GenConfig& cfg,
                                                const std::function<void(int)>& cb);
+    std::vector<int> decode_loop_stream(const GenConfig& cfg, const std::function<void(int)>& cb);
     static constexpr int kSnapshotSlots = 4;
     void snapshot(int slot = 0);
     void restore(int slot = 0);

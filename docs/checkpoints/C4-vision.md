@@ -197,3 +197,7 @@ Both return the same caption. Cache is in-memory only, capped at 32 images
 (~128 MB at 992 tokens), and does not persist across server restarts.
 
 `/metrics` now exposes `miori_image_cache_entries` (currently 32-entry LRU).
+
+Image requests now stream SSE per token: the handler sends the SSE header after
+vision encode, then `Engine::decode_loop_stream` emits a delta per sampled token
+(10 events for 8 tokens in the cat test).

@@ -540,13 +540,44 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
             std::string r = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             send_all(fd, r); ::close(fd); return;
         }
+        if (stream) {
+            std::string h = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                            "Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+            if (!send_all(fd, h)) { ::close(fd); return; }
+        }
         {
             std::lock_guard<std::mutex> lock(mu);
             eng.reset();
             eng.prefill_embeds(host.data(), (int)ids.size(), true);
-            out = eng.decode_loop(cfg);
+            if (stream) {
+                std::vector<int> all;
+                std::string sent;
+                out = eng.decode_loop_stream(cfg, [&](int t) {
+                    all.push_back(t);
+                    std::string full = tok.decode_plain(all);
+                    if (full.size() > sent.size()) {
+                        std::string piece = full.substr(sent.size());
+                        sent = full;
+                        std::string ev = "data: {\"id\":\"chatcmpl-miori\",\"object\":\"chat.completion.chunk\","
+                                         "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
+                                         json_escape(piece) + "\"},\"finish_reason\":null}]}\n\n";
+                        send_all(fd, ev);
+                    }
+                });
+            } else {
+                out = eng.decode_loop(cfg);
+            }
         }
         prompt_tokens = ids.size();
+        if (stream) {
+            g_requests.fetch_add(1);
+            g_tokens.fetch_add((long)out.size());
+            send_all(fd, "data: {\"id\":\"chatcmpl-miori\",\"choices\":[{\"index\":0,\"delta\":{},"
+                         "\"finish_reason\":\"stop\"}]}\n\n");
+            send_all(fd, "data: [DONE]\n\n");
+            ::close(fd);
+            return;
+        }
     } else if (batch_path) {
         // Greedy requests go through the 4-slot batch decoder.
         auto job = std::make_shared<Job>();
