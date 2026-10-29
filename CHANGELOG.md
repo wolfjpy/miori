@@ -1,5 +1,14 @@
 # Changelog
 
+## v0.3.3
+
+- Honor `top_p`, `top_k` and `seed` from chat requests; clamp `max_tokens`.
+- Per-request `max_pixels` for image inputs (65536..4194304).
+- 15-minute / 27,360-request soak with memory plateau (10.85 GB).
+- C1 note: split-K threshold experiments were neutral and reverted; 100 tok/s
+  depends on a fresh/cooldown device.
+- Clean build: zero warnings.
+
 ## v0.3.2
 
 - Startup warmup for Engine + BatchEngine (`MIORI_NO_WARMUP=1` to disable).

@@ -1,4 +1,4 @@
-# STATUS — 2026-10-29 (v0.3.2)
+# STATUS — 2026-10-29 (v0.3.3)
 
 Miori is a Metal + C++20 LFM3-VL-2B-MLX-4bit engine for the Apple M6 / 16 GB
 Mac mini. Text, batching, vision, mixed-precision KV, prefix snapshots and
@@ -49,7 +49,7 @@ tok/s target is **NO-GO** with the current fixed-slot / packed-prefill design.
 - **M6 C6**: PARTIAL — kernel tests, PPL, KV modes, 12,409-request mixed soak,
   resident high-water verified stable across 100 image requests. No 24 h run or
   full KL matrix.
-- **M7 C7**: **v0.3.2 released** (v0.3.0 features + regression matrix);
+- **M7 C7**: **v0.3.3 released** (v0.3.0 features + regression matrix);
   binaries, benchmarks, checkpoints and changelog are present.
 
 ## Known gaps (in order of impact)

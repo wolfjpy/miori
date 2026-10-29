@@ -3,7 +3,7 @@
 Metal + C++20 inference engine for `LiquidAI/LFM3-VL-2B-MLX-4bit` on Apple M6 / 16 GB.
 No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ host.
 
-## Status (v0.3.2)
+## Status (v0.3.3)
 
 | Area | State |
 |---|---|
