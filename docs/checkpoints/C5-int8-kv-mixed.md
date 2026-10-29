@@ -134,3 +134,16 @@ With `MIORI_KV_MIX=vk`:
   no server metric exposing the KV mode.
 - Mixed decode is slower than bf16; a future kernel could hoist the uniform
   mixed-format branch out of the key loop.
+
+## Mixed KV under 64-concurrent load (added)
+
+64 concurrent 23-token prompts, 16 greedy tokens, `MIORI_KV_MIX=vk`:
+
+```
+wall 2.04 s (bf16 default: 1.94-2.02 s)
+all 64 responses in the <=2.5 s latency bucket
+```
+
+The mixed format saves ~0.7 GB of KV but is slightly slower at this context
+(int8 V dequant); it remains opt-in. `MIORI_EXACT` / per-request `exact:true`
+still use the selected KV mode.
