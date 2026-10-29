@@ -44,6 +44,7 @@ bool Engine::init(std::string& err) {
         tokbuf_ = buf(16);
         px_ = buf(128ull * 2048 * 4);
         ph_ = buf(128ull * 2048 * 2);
+        img_emb_ = buf(4096ull * 2048 * 2);
         pq_ = buf(128ull * 2048 * 4);
         pk_ = buf(128ull * 512 * 4);
         pv_ = buf(128ull * 512 * 4);

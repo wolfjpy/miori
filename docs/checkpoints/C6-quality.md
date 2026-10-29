@@ -107,3 +107,19 @@ No crash/429/500. Resident footprint rose ~0.6 GB versus the text-only 5-minute
 run, consistent with first-touch of image/vision/packed buffers plus allocator
 high-water; it is still 1.9 GB below the 12.71 GB recommended working set. A 24 h
 soak is still required to distinguish high-water from a slow leak.
+
+## Image-path memory high-water
+
+The per-request image embedding buffer was replaced by one 16 MB
+`Engine::image_embed_buffer()` reused by all image requests (no per-request
+`alloc_temp`/`release`).
+
+100 sequential image requests (cached features) after startup:
+
+```
+resident: 10.82 GB (identical after 20 and after 100 requests)
+```
+
+So the +0.6 GB seen in the mixed soak is one-time high-water from touching the
+vision/Engine image buffers and Metal command buffers, not a per-request leak.
+Text-only steady state remains ~10.28 GB; image-capable steady state ~10.82 GB.

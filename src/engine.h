@@ -49,6 +49,7 @@ public:
     void restore(int slot = 0);
     bool has_snapshot(int slot = 0) const { return has_snapshot_[slot]; }
     MTL::Buffer* alloc_temp(size_t bytes) { return m_.new_buffer(bytes); }
+    MTL::Buffer* image_embed_buffer() const { return img_emb_; }
     void reset();
     const float* logits() const;
     int pos() const { return pos_; }
@@ -120,6 +121,7 @@ private:
     MTL::Buffer* tokbuf_ = nullptr;  // [1] u32 (padded)
     MTL::Buffer* px_ = nullptr;
     MTL::Buffer* ph_ = nullptr;
+    MTL::Buffer* img_emb_ = nullptr;
     MTL::Buffer* pq_ = nullptr;
     MTL::Buffer* pk_ = nullptr;
     MTL::Buffer* pv_ = nullptr;

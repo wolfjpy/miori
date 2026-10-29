@@ -568,14 +568,13 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
             std::string r = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             send_all(fd, r); ::close(fd); return;
         }
-        MTL::Buffer* emb = eng.alloc_temp((size_t)ids.size() * 2048 * 2);
+        MTL::Buffer* emb = eng.image_embed_buffer();
         std::vector<uint16_t> host((size_t)ids.size() * 2048);
         {
             std::lock_guard<std::mutex> lock(mu);
             eng.embed_tokens(ids.data(), (int)ids.size(), emb);
         }
         memcpy(host.data(), emb->contents(), host.size() * 2);
-        emb->release();
         int spliced = 0;
         const int total_feats = (int)(feats.size() / 2048);
         for (size_t i = 0; i < ids.size(); ++i) {
