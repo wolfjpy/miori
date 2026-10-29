@@ -516,8 +516,11 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
     std::vector<int> out;
     size_t prompt_tokens = 0;
     GenConfig cfg;
-    cfg.max_tokens = max_tokens;
+    cfg.max_tokens = std::max(1, std::min(max_tokens, 4096));
     cfg.temperature = temp;
+    if (root.contains("top_p")) cfg.top_p = std::max(0.01f, std::min(1.0f, (float)root["top_p"].as_double()));
+    if (root.contains("top_k")) cfg.top_k = std::max(1, (int)root["top_k"].as_int());
+    if (root.contains("seed")) cfg.seed = (uint64_t)root["seed"].as_int();
     const bool batch_path = (temp <= 0.01f && !g_exact && !exact_req);
     const bool live_stream = stream && !batch_path && image_urls.empty();
     if (live_stream) {

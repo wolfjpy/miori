@@ -166,3 +166,10 @@ First `2+2` request after startup, 20 s after launch:
 no warmup: 0.179 s, second 0.055 s
 warmup:    0.148 s, second 0.048 s
 ```
+
+## Sampling parameters
+
+`top_p`, `top_k` and `seed` from the OpenAI request are now passed into
+`GenConfig` (previously ignored; defaults top_k=50, top_p=1.0, seed=1234).
+`max_tokens` is clamped to [1, 4096]. Verified with
+`temperature=0.8, top_p=0.5, top_k=20, seed=7` -> coherent sentence.
