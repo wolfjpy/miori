@@ -156,3 +156,21 @@ at ~2 TFLOPS (K=64 gives low arithmetic intensity) while the FFN reaches
    `gemm_naive`; **GO for functionality, NO-GO for latency** (512² = 254 ms).
 3. This report: all dense GEMMs and the attention moved to MPP tensor cores;
    **GO for functionality and latency**.
+
+## HTTP image input (added)
+
+`serve` now accepts OpenAI-style `image_url` data URLs (base64 JPEG/PNG). The
+request path decodes to a temp file, preprocesses at max_pixels=1,048,576,
+encodes the tower, splices the features into `<|image|>` tokens, and runs
+`prefill_embeds` + decode under the Engine mutex. Text-only requests still use the
+batch scheduler.
+
+Measured:
+
+```
+POST /v1/chat/completions  content=[text, image_url(data:image/jpeg;base64,...)]
+-> "The image shows a close-up of an orange tabby cat with green eyes, ..."
+```
+
+Limitations: one image per request, no multi-image ragged batch, no vision queue
+or feature cache, fixed max_pixels in the server, video out of scope.

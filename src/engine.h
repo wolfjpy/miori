@@ -39,7 +39,8 @@ public:
     std::vector<int> generate_from_state(const std::vector<int>& suffix, const GenConfig& cfg);
     void snapshot();
     void restore();
-    bool has_snapshot() const { return has_snapshot_; };
+    bool has_snapshot() const { return has_snapshot_; }
+    MTL::Buffer* alloc_temp(size_t bytes) { return m_.new_buffer(bytes); }
     void reset();
     const float* logits() const;
     int pos() const { return pos_; }

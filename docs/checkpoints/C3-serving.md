@@ -49,3 +49,9 @@ latency is ~5.8 s. The 64-concurrency gate is therefore still unmet.
 
 Added: `miori_queue_depth` in `/metrics`, and a 429 response when the scheduler
 queue exceeds 256 requests.
+
+## Image input
+
+`image_url` base64 (JPEG/PNG) is accepted and routed through the vision tower to
+a captioned response. Text-only requests still use the 4-slot batch scheduler;
+image requests take the single-sequence path under the Engine mutex.

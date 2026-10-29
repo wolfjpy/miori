@@ -13,7 +13,8 @@
 | OpenAI HTTP + SSE | working, serialized | `C3` |
 | Vision tower + projector + splice | working in CLI (`vision-run`); 512² = 32 ms (warm) | `C4` |
 | Vision on MPP tensor cores | 8.2× vs SIMT: 261 → 32 ms (512²), 2028 → 271 ms (1024²) | `C4` |
-| Vision in HTTP API / multi-image batch | **not implemented** | `C4` |
+| Vision in HTTP API | working (one base64 image per request) | `C4` |
+| Multi-image batch / vision queue | **not implemented** | `C4` |
 | Paged KV / int8 KV | **not implemented** | `C2`, `C5` |
 | Single-prefix KV cache | working in CLI and HTTP (one system slot) | `C5` |
 | Fixed-slot batch decode (Bmax=4) | working, CLI `batch-test` only | `C2` |

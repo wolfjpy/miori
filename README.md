@@ -16,7 +16,8 @@ No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ 
 | Batch decode (Bmax=4) | working, server-integrated |
 | Vision tower (patchifier, 14 layers, projector) | working: `vision-run` captions photos |
 | Vision on MPP tensor cores (bf16 tile-major cache) | working: 8.2× faster than the SIMT path |
-| Vision in the HTTP API / multi-image batch | **not implemented** |
+| Vision in the HTTP API | working, one base64 image per request |
+| Multi-image batch / vision queue | **not implemented** |
 | Paged KV / continuous batching | **not implemented** |
 | int8 KV / prefix cache / shared-prefix attention | **not implemented** |
 
