@@ -119,3 +119,13 @@ Logs: `bench/results/C5-int8/mixed-*`; report
 4 full-prefix snapshots (KV+conv, ~92 MB each) with LRU by system prompt.
 Alternating two system prompts: A cold 0.118 s, B cold 0.084 s, A warm 0.043 s,
 B warm 0.054 s (exact mode, 8 output tokens).
+
+## Long-context limit (C2 target)
+
+A 3781-token prompt (two READMEs) on the single path: **2.33 s** prefill
+(~1620 tok/s) + 4 output tokens. The packed-prefill pass is capped at
+`kPackRows=1024` and `kBmax=32`, so prompts above 1024 tokens fall back to
+sequential `add_sequence`; 64 concurrent 2K prompts would cost roughly
+64 x 1.2 s of prefill before decode. The C2 target (64 x 2K / 4K at 2.5K output
+tok/s) is therefore **not met** with the current packed-prefill design; closing
+it requires chunked continuous prefill and paged KV, not more slots.

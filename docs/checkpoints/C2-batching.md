@@ -438,3 +438,11 @@ B=32: 48.8 ms/step / 655 tok/s, slightly worse than the 4-group kernel
 - 32-row `m=32,n=64` tile with 4 simdgroups for `step_b_ <= 32`:
   **46.34 ms/step / 691 tok/s** vs 46.76 ms for the 64-row tile. Within noise,
   but it avoids wasted M rows; kept for M<=32, 64-row tile for M>32.
+
+### C2 2K/4K limit (measured)
+
+Single 3781-token prompt: 2.33 s / 4 output tokens (~1620 tok/s prefill).
+Packed prefill caps at 1024 tokens per pass and 32 requests; longer prompts fall
+back to the sequential path. 64 x 2K prompts therefore spend ~64 x 1.2 s in
+prefill alone. The original 64 x 2K/4K @ 2.5K output tok/s gate remains unmet;
+the limiting subsystems are chunked continuous prefill and paged KV, not B.
