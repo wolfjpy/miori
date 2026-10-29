@@ -123,3 +123,14 @@ in 0.78 s with 16 tokens each.
 Limitations: the small-queue single path, `MIORI_EXACT=1`, image requests and
 temperature sampling still emit SSE after generation (one or more chunks), not
 per token; only the batch path is token-streamed.
+
+### Single-path streaming (added)
+
+`Engine::generate_from_state_stream(suffix, cfg, cb)` invokes the callback after
+every sampled token. The server uses it for `MIORI_EXACT=1` and temperature>0
+requests: SSE header is sent before prefill, then one delta per token. Image
+requests still emit SSE after generation.
+
+Verified: `MIORI_EXACT=1`, "What is 2+2?" -> 3 SSE events, text `4`;
+temperature 0.7, 8 tokens -> 10 SSE events, text
+"The sun is setting behind the mountains."

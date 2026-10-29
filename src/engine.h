@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <functional>
 
 namespace miori {
 
@@ -37,6 +38,8 @@ public:
     void prefill_embeds(const uint16_t* embeds, int T, bool need_logits);
     std::vector<int> decode_loop(const GenConfig& cfg);
     std::vector<int> generate_from_state(const std::vector<int>& suffix, const GenConfig& cfg);
+    std::vector<int> generate_from_state_stream(const std::vector<int>& suffix, const GenConfig& cfg,
+                                               const std::function<void(int)>& cb);
     static constexpr int kSnapshotSlots = 4;
     void snapshot(int slot = 0);
     void restore(int slot = 0);

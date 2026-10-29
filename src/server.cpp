@@ -470,6 +470,13 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
     GenConfig cfg;
     cfg.max_tokens = max_tokens;
     cfg.temperature = temp;
+    const bool batch_path = (temp <= 0.01f && !g_exact);
+    const bool live_stream = stream && !batch_path && image_urls.empty();
+    if (live_stream) {
+        std::string h = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"
+                        "Cache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
+        if (!send_all(fd, h)) { ::close(fd); return; }
+    }
     if (!image_urls.empty() && vis) {
         std::vector<uint16_t> feats;
         std::vector<int> counts;
@@ -540,7 +547,7 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
             out = eng.decode_loop(cfg);
         }
         prompt_tokens = ids.size();
-    } else if (temp <= 0.01f && !g_exact) {
+    } else if (batch_path) {
         // Greedy requests go through the 4-slot batch decoder.
         auto job = std::make_shared<Job>();
         job->prompt = tok.chat(system, user, thinking);
@@ -635,7 +642,33 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         } else {
             eng.restore(slot);
         }
-        out = eng.generate_from_state(suffix, cfg);
+        if (live_stream) {
+            std::vector<int> all;
+            std::string sent;
+            out = eng.generate_from_state_stream(suffix, cfg, [&](int t) {
+                all.push_back(t);
+                std::string full = tok.decode_plain(all);
+                if (full.size() > sent.size()) {
+                    std::string piece = full.substr(sent.size());
+                    sent = full;
+                    std::string ev = "data: {\"id\":\"chatcmpl-miori\",\"object\":\"chat.completion.chunk\","
+                                     "\"choices\":[{\"index\":0,\"delta\":{\"content\":\"" +
+                                     json_escape(piece) + "\"},\"finish_reason\":null}]}\n\n";
+                    send_all(fd, ev);
+                }
+            });
+        } else {
+            out = eng.generate_from_state(suffix, cfg);
+        }
+    }
+    if (live_stream) {
+        g_requests.fetch_add(1);
+        g_tokens.fetch_add((long)out.size());
+        send_all(fd, "data: {\"id\":\"chatcmpl-miori\",\"choices\":[{\"index\":0,\"delta\":{},"
+                     "\"finish_reason\":\"stop\"}]}\n\n");
+        send_all(fd, "data: [DONE]\n\n");
+        ::close(fd);
+        return;
     }
     g_requests.fetch_add(1);
     g_tokens.fetch_add((long)out.size());
