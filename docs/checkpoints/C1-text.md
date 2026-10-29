@@ -51,3 +51,14 @@ prompt=4096 output=32
 prefill: 2.462 s  1663.7 tok/s
 decode:  0.347 s    92.2 tok/s  (111.8 GB/s effective)
 ```
+
+## Short-context split-K tuning (negative, reverted)
+
+Tried lowering the split-K threshold from 512 to 64 (16 splits) and 4 splits for
+64..511: short-context decode moved only 85.6-87.8 -> 87.7-89.3 tok/s, within
+noise. Reverted to `pos >= 512`, 16 splits.
+
+After ~1 h of continuous benchmarking/soak the same binary measured 86-88 tok/s
+at 1K (vs 100.4 tok/s on a fresh v0.3.2 run); this is device thermal/load
+variance, not a code change. The C1 100 tok/s gate should be reported with the
+measurement conditions (fresh boot/cooldown).
