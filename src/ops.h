@@ -206,12 +206,4 @@ void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
                 MTL::Buffer* B, MTL::Buffer* C, uint32_t M, uint32_t N, uint32_t K,
                 uint32_t boff = 0);
 
-void gemm_mpp_s8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
-                 MTL::Buffer* B, MTL::Buffer* C, uint32_t M, uint32_t N, uint32_t K,
-                 uint32_t boff = 0);
-
-void gemm_mpp2(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
-               MTL::Buffer* B1, MTL::Buffer* B2, MTL::Buffer* C1, MTL::Buffer* C2,
-               uint32_t M, uint32_t N, uint32_t K, uint32_t off1, uint32_t off2);
-
 }  // namespace miori
