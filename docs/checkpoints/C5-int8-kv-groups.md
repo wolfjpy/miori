@@ -3,7 +3,7 @@
 - Date: 2026-10-29
 - Machine: Apple M6 Mac mini, 12 GPU cores, 16 GB, macOS 27.0.1 (26A434), Xcode 27.1
 - Build: `make -j` (`metal4.1 -O3 -fno-fast-math`)
-- Baseline: `2679822` (single-scale int8 KV); this change is committed with this report
+- Baseline: `b35ba6b` (single-scale int8 KV); this change is committed with this report
 - Status: **NO-GO for the strict C5 gate** — mean KL, p99 KL and PPL clear; top-1
   reaches 99.34 % aggregate vs the 99.5 % gate, so int8 KV remains opt-in and
   bf16 remains the default.

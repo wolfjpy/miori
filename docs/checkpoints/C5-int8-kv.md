@@ -3,7 +3,7 @@
 - Date: 2026-10-29
 - Machine: Apple M6 Mac mini, 12 GPU cores, 16 GB, macOS 27.0.1 (26A434), Xcode 27.1
 - Build: `make -j` (`metal4.1 -O3 -fno-fast-math`)
-- Baseline: `a316537`; the int8 KV change is committed with this report
+- Baseline: `6feb0b5`; the int8 KV change is committed with this report
 - Status: **PARTIAL / NO-GO for the strict C5 quality gate** — the int8 path is
   implemented, correct and opt-in, but `top-1` misses the 99.5 % project gate;
   it stays off by default (`MIORI_KV_INT8=1` enables it).

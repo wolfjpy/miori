@@ -3,7 +3,7 @@
 - Date: 2026-10-29
 - Machine: Apple M6 Mac mini, 12 GPU cores, 16 GB, macOS 27.0.1 (26A434), Xcode 27.1
 - Build: `make -j` (`metal4.1 -O3 -fno-fast-math`)
-- Baseline: `ac3edb8` (32-group full-int8 KV); this change is committed with this report
+- Baseline: `027398a` (32-group full-int8 KV); this change is committed with this report
 - Status: **GO for the mixed mode `MIORI_KV_MIX=vk` (K bf16, V int8)**. It passes the
   strict 4-domain gate; bf16 remains the default and full int8 (K+V) remains opt-in
   but still below the top-1 gate.
