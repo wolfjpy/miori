@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -342,6 +344,43 @@ int main(int argc, char** argv) {
         for (int i = 1; i + 1 < argc; ++i)
             if (std::string(argv[i]) == "--port") port = atoi(argv[i + 1]);
         return run_server(m, w, port);
+    } else if (cmd == "ppl") {
+        Tokenizer t;
+        if (!t.load("models/tokenizer.json", err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        Engine e(m, w);
+        if (!e.init(err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        std::string file = "docs/README.md";
+        int max_tokens = 256;
+        for (int i = 1; i + 1 < argc; ++i) {
+            if (std::string(argv[i]) == "--file") file = argv[i + 1];
+            if (std::string(argv[i]) == "--tokens") max_tokens = atoi(argv[i + 1]);
+        }
+        std::ifstream f(file);
+        std::stringstream ss;
+        ss << f.rdbuf();
+        auto ids = t.encode(ss.str());
+        ids.insert(ids.begin(), 124894);
+        if ((int)ids.size() > max_tokens) ids.resize(max_tokens);
+        if (ids.size() < 2) { fprintf(stderr, "corpus too short\n"); return 1; }
+        double nll = 0.0;
+        for (size_t i = 1; i < ids.size(); ++i) {
+            e.forward(ids[i - 1], (int)(i - 1), true);
+            const float* lg = e.logits();
+            float mx = lg[0];
+            for (int k = 1; k < 128000; ++k) mx = std::max(mx, lg[k]);
+            double sum = 0.0;
+            for (int k = 0; k < 128000; ++k) sum += std::exp((double)(lg[k] - mx));
+            const double cur = (double)mx + std::log(sum) - (double)lg[ids[i]];
+            if (getenv("MIORI_PPL_DEBUG")) {
+                int rank = 0;
+                for (int k = 0; k < 128000; ++k) if (lg[k] > lg[ids[i]]) ++rank;
+                fprintf(stderr, "%zu id=%d rank=%d nll=%.3f  ", i, ids[i], rank, cur);
+                fprintf(stderr, "%s\n", t.token(ids[i]).c_str());
+            }
+            nll += cur;
+        }
+        printf("ppl: %.3f over %zu tokens (%s)\n",
+               std::exp(nll / (double)(ids.size() - 1)), ids.size() - 1, file.c_str());
     } else if (cmd == "bench") {
         Tokenizer t;
         if (!t.load("models/tokenizer.json", err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }

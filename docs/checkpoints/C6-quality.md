@@ -16,3 +16,20 @@
 
 Not done: 2048-position KL matrix, int8 KV quality, 32K validation, 24h soak,
 fault injection.
+
+## Perplexity harness (added)
+
+`./build/miori ppl --file <corpus> --tokens N` runs teacher-forced NLL through the
+decode path and reports perplexity. It prepends BOS (`<|startoftext|>`); without
+BOS the same sentence scores PPL 771 for `The capital of France is Paris.`,
+with BOS PPL 18.6 and `Paris` is rank 0 (NLL 0.004).
+
+| Corpus | Tokens | PPL |
+|---|---:|---:|
+| `The capital of France is Paris.` | 7 | 18.60 |
+| 5-sentence English paragraph | 81 | 42.53 |
+| `docs/README.md` (mixed EN/ZH/Markdown) | 127 | 94.79 |
+
+The English PPL is higher than expected for a 2B model; possible causes are the
+approximate Unicode pre-tokenizer and the mixed-domain corpus. It is reported as
+a regression baseline, not as a quality pass.

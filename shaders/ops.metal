@@ -704,3 +704,46 @@ kernel void attn_combine(device const float* pacc [[buffer(0)]],
     }
     out[qh * 128u + d] = (l > 0.0f) ? acc / l : 0.0f;
 }
+
+// 4-bit GEMV, 2 rows per warp (16 lanes per row).
+kernel void gemv4x2(device const uint4* q [[buffer(0)]],
+                    device const bfloat* s [[buffer(1)]],
+                    device const bfloat* b [[buffer(2)]],
+                    device const bfloat* x [[buffer(3)]],
+                    device float* y [[buffer(4)]],
+                    constant uint& N [[buffer(5)]],
+                    constant uint& K [[buffer(6)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint lane [[thread_index_in_simdgroup]],
+                    uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint grp = lane / 16u;
+    const uint li = lane % 16u;
+    const uint row = tg * 16u + warp * 2u + grp;
+    if (row >= N) return;
+    const uint ng = K / 32u;
+    device const uint4* qrow = q + (ulong)row * (K / 32u);
+    device const bfloat* srow = s + (ulong)row * ng;
+    device const bfloat* brow = b + (ulong)row * ng;
+    float acc = 0.0f;
+    for (uint g = li; g < ng; g += 16u) {
+        uint4 w = qrow[g];
+        uint ww[4] = {w.x, w.y, w.z, w.w};
+        const float sc = float(srow[g]);
+        const float bi = float(brow[g]);
+        const uint base = g * 32u;
+        #pragma unroll
+        for (uint wi = 0; wi < 4u; ++wi) {
+            const uint v = ww[wi];
+            #pragma unroll
+            for (uint j = 0; j < 8u; ++j) {
+                const float qv = float((v >> (4u * j)) & 0xFu);
+                acc = fma(qv * sc + bi, float(x[base + wi * 8u + j]), acc);
+            }
+        }
+    }
+    acc += simd_shuffle_down(acc, 1);
+    acc += simd_shuffle_down(acc, 2);
+    acc += simd_shuffle_down(acc, 4);
+    acc += simd_shuffle_down(acc, 8);
+    if (li == 0u) y[row] = acc;
+}

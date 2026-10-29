@@ -413,4 +413,19 @@ void attn_combine(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* pacc,
     e->dispatchThreadgroups(MTL::Size::Make(16, 1, 1), MTL::Size::Make(128, 1, 1));
 }
 
+void gemv4x2(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
+             const Tensor& q, const Tensor& s, const Tensor& b,
+             MTL::Buffer* x, MTL::Buffer* y, uint32_t N, uint32_t K) {
+    auto p = m.pso("gemv4x2");
+    e->setComputePipelineState(p);
+    e->setBuffer(w.buffer(), q.begin, 0);
+    e->setBuffer(w.buffer(), s.begin, 1);
+    e->setBuffer(w.buffer(), b.begin, 2);
+    e->setBuffer(x, 0, 3);
+    e->setBuffer(y, 0, 4);
+    e->setBytes(&N, sizeof(N), 5);
+    e->setBytes(&K, sizeof(K), 6);
+    e->dispatchThreadgroups(MTL::Size::Make((N + 15) / 16, 1, 1), MTL::Size::Make(256, 1, 1));
+}
+
 }  // namespace miori

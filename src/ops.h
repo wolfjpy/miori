@@ -114,4 +114,8 @@ void attn_combine(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* pacc,
                   MTL::Buffer* pm, MTL::Buffer* pl, MTL::Buffer* out,
                   uint32_t splits);
 
+void gemv4x2(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
+             const Tensor& q, const Tensor& s, const Tensor& b,
+             MTL::Buffer* x, MTL::Buffer* y, uint32_t N, uint32_t K);
+
 }  // namespace miori

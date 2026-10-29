@@ -108,3 +108,9 @@ Reported on the target M6: prefill 2542 tok/s, decode 94.1 tok/s at 1K context
 ## Metrics
 
 `GET /metrics` exposes `miori_requests_total` and `miori_output_tokens_total`.
+
+## Perplexity
+
+```bash
+./build/miori ppl --file /tmp/en.txt --tokens 200
+```
