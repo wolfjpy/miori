@@ -425,6 +425,64 @@ static int cmd_vision_run(Metal& m, Weights& w, int argc, char** argv) {
     return 0;
 }
 
+static int cmd_batch_sparse(Metal& m, Weights& w) {
+    Tokenizer t;
+    std::string err;
+    if (!t.load("models/tokenizer.json", err)) {
+        fprintf(stderr, "tokenizer: %s\n", err.c_str());
+        return 1;
+    }
+    Engine e(m, w);
+    if (!e.init(err)) { fprintf(stderr, "engine: %s\n", err.c_str()); return 1; }
+    BatchEngine be(m, w, e);
+    if (!be.init(err)) { fprintf(stderr, "batch: %s\n", err.c_str()); return 1; }
+    be.set_kernels(BatchEngine::Kernels::Gemv4);
+
+    const std::string sys = "You are a helpful assistant.";
+    std::vector<std::string> prompts = {
+        "The capital of France is", "List the first four primes.",
+        "What is 2+2?", "Name three colors."};
+    GenConfig cfg;
+    cfg.max_tokens = 3;
+    cfg.temperature = 0.0f;
+    std::vector<std::vector<int>> ids, ref;
+    for (auto& p : prompts) {
+        ids.push_back(t.chat(sys, p, false));
+        ref.push_back(e.generate(ids.back(), cfg));
+    }
+    std::vector<int> slots;
+    for (auto& v : ids) slots.push_back(be.add_sequence(v, 3));
+    int guard = 20;
+    while (be.running() > 0 && guard-- > 0) be.decode_step();
+    for (size_t i = 0; i < slots.size(); ++i)
+        if ((i == 1 || i == 3) && slots[i] >= 0) be.release_slot(slots[i]);
+
+    std::vector<std::string> prompts2 = {
+        "What is the capital of Italy?", "Describe the ocean in one word."};
+    std::vector<std::vector<int>> ids2, ref2;
+    cfg.max_tokens = 4;
+    for (auto& p : prompts2) {
+        ids2.push_back(t.chat(sys, p, false));
+        ref2.push_back(e.generate(ids2.back(), cfg));
+    }
+    std::vector<int> slots2;
+    for (auto& v : ids2) slots2.push_back(be.add_sequence(v, 4));
+    guard = 20;
+    while (be.running() > 0 && guard-- > 0) be.decode_step();
+
+    int bad = 0;
+    for (size_t i = 0; i < prompts2.size(); ++i) {
+        if (slots2[i] < 0) { printf("sparse: add failed\n"); return 1; }
+        const auto& g = be.generated(slots2[i]);
+        bool same = g == ref2[i];
+        printf("sparse %zu slot %d: %s (%zu vs %zu tokens)\n", i, slots2[i],
+               same ? "identical" : "DIFF", g.size(), ref2[i].size());
+        if (!same) ++bad;
+    }
+    printf("batch-sparse-test: %s\n", bad ? "FAIL" : "PASS");
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
     NS::AutoreleasePool* pool = NS::AutoreleasePool::alloc()->init();
     std::string cmd = argc > 1 ? argv[1] : "info";
@@ -1383,6 +1441,8 @@ int main(int argc, char** argv) {
         printf("test-mpp-tile: N=%u K=%u, rows 0..%u of 64\n", N, K, M - 1);
         cmp(p32, p64, "gemm_mpp32(M=23) vs gemm_mpp(M=23)");
         cmp(p64, p64b, "gemm_mpp(M=23) vs gemm_mpp(M=64)");
+    } else if (cmd == "batch-sparse-test") {
+        return cmd_batch_sparse(m, w);
     } else if (cmd == "batch-prefill-test") {
         // Packed multi-request prefill vs the sequential Engine path.
         Tokenizer t;

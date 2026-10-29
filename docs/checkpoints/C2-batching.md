@@ -446,3 +446,15 @@ Packed prefill caps at 1024 tokens per pass and 32 requests; longer prompts fall
 back to the sequential path. 64 x 2K prompts therefore spend ~64 x 1.2 s in
 prefill alone. The original 64 x 2K/4K @ 2.5K output tok/s gate remains unmet;
 the limiting subsystems are chunked continuous prefill and paged KV, not B.
+
+## Sparse slot reuse test
+
+`batch-sparse-test` runs four sequences, finishes them, releases only slots 1
+and 3, then admits two new prompts into those sparse slots through the exact
+GEMV path. Both new sequences are token-identical to single-stream references:
+
+```
+sparse 0 slot 1: identical
+sparse 1 slot 3: identical
+batch-sparse-test: PASS
+```

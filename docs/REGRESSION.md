@@ -33,6 +33,7 @@ float reference, not a kernel error (`state err = 0`).
 | check | result |
 |---|---|
 | `batch-prefill-test --n 32` | 6/6 KV+conv byte-identical, 3.13x |
+| `batch-sparse-test` | reused slots 1 and 3 token-identical to single-stream |
 | `kv-int8-test --mix vk --tokens 512` | PPL +0.130%, top-1 99.217%; 4-domain aggregate passes at 99.560% |
 | 4 concurrent greedy HTTP | all `The capital of France is Paris.` |
 | SSE stream `What is 2+2?` | 3 events, text `4` |
