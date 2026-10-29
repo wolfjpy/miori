@@ -77,3 +77,18 @@ to the token path (`max |Δlogit| = 0`).
 - Server batch path uses bf16 MPP; over 8 prompts x 32 tokens it agrees with
   the exact 4-bit path on 89.1% of tokens. `MIORI_EXACT=1` forces the exact
   single-sequence path.
+
+## Streaming
+
+- Batch greedy: one SSE delta per decode step (scheduler publishes new tokens).
+- `MIORI_EXACT=1` and temperature sampling: one delta per sampled token
+  (`Engine::generate_from_state_stream`).
+- Image requests: SSE header after vision encode, then one delta per token
+  (`Engine::decode_loop_stream`).
+- 8 concurrent stream requests, 16 tokens: 0.78 s wall.
+
+## Prefix cache
+
+4 full-prefix snapshots (KV+conv, ~92 MB each) with LRU by system prompt.
+Alternating two system prompts: A cold 0.118 s, B cold 0.084 s, A warm 0.043 s,
+B warm 0.054 s (exact mode, 8 output tokens).
