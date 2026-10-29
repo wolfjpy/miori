@@ -1,4 +1,4 @@
-# Regression matrix (v0.3.2)
+# Regression matrix (v0.3.4)
 
 Machine: Apple M6, 16 GB, macOS 27.0.1, Xcode 27.1.
 Build: `make clean && make -j` -> 0 warnings, `build/miori` + `build/miori.metallib`.
@@ -64,3 +64,18 @@ float reference, not a kernel error (`state err = 0`).
 - `/metrics`: resident bytes, request latency histogram.
 - `batch-sparse-test` (sparse slot 1/3 reuse) PASS.
 - Clean build: 0 warnings.
+
+## v0.3.4 rerun (warm device)
+
+Functional checks all pass: `Paris`, sparse PASS, packed prefill bit-identical
+(2.95x this run), `/health` v0.3.4, `/v1/models` metadata, `2+2 -> 4`.
+
+Performance on a warm device after the long soak:
+
+```
+bench 1K: prefill 2460 tok/s, decode 84.6 tok/s
+vision 512: 35.7 ms steady (first warm 40.1 ms)
+```
+
+A fresh/cooldown v0.3.2 run measured 2897 tok/s prefill and 100.4 tok/s decode;
+the difference is thermal/load, not a code change.
