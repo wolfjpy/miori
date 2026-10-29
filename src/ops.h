@@ -101,4 +101,8 @@ void postnorm_add(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* x,
                   MTL::Buffer* src, const Weights& w, const Tensor& gamma,
                   MTL::Buffer* out, uint32_t rows, uint32_t n, float eps);
 
+void gemv4_raw(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+               MTL::Buffer* s, MTL::Buffer* b, MTL::Buffer* x, MTL::Buffer* y,
+               uint32_t N, uint32_t K);
+
 }  // namespace miori

@@ -29,6 +29,8 @@ public:
     void reset();
     const float* logits() const;
     int pos() const { return pos_; }
+    double last_prefill_s() const { return last_prefill_s_; }
+    double last_decode_s() const { return last_decode_s_; }
 
 private:
     Metal& m_;
@@ -80,6 +82,10 @@ private:
     MTL::Buffer* hlast_ = nullptr;
     MTL::Buffer* ptokens_ = nullptr;
     MTL::Buffer* wbf_ = nullptr;
+    MTL::Buffer* lm4_ = nullptr;
+    MTL::Buffer* lm4s_ = nullptr;
+    MTL::Buffer* lm4b_ = nullptr;
+    bool lm4_ok_ = false;
     std::unordered_map<std::string, uint32_t> woff_;
     uint32_t wbf_used_ = 0;
     MTL::Buffer* kc_[24] = {};
@@ -89,6 +95,8 @@ private:
     MTL::CommandBuffer* cb_ = nullptr;
     MTL::ComputeCommandEncoder* e_ = nullptr;
     int pos_ = 0;
+    double last_prefill_s_ = 0.0;
+    double last_decode_s_ = 0.0;
 
     const Tensor& norm(int layer, const char* which) const;
     void qw(int layer, const char* proj, const Tensor*& q, const Tensor*& s,

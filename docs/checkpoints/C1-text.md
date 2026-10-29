@@ -22,3 +22,16 @@
   the ~125 GB/s sustained target. The remaining gap is dispatch/sampling overhead.
 - Prefill is tensor-core bound (MPP `matmul2d`), 128-token chunks.
 - No speculative decoding, no int8 KV, no paged KV.
+
+## Reproducible bench (added after the first report)
+
+```
+./build/miori bench --prefill 1024 --decode 128
+prompt=1024 output=128
+prefill: 0.403 s  2541.9 tok/s
+decode:  1.538 s    83.2 tok/s  (100.8 GB/s effective)
+```
+
+At 1K context the decode rate drops from 97.5 (2-token context) to 83.2 because
+the decode-attention kernel launches only 4 threadgroups per layer (one per KV
+head) and is latency-bound. Split-K attention is the next step.

@@ -73,6 +73,22 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu) {
     std::string body;
     std::string header = read_request(fd, body);
     if (header.empty()) { ::close(fd); return; }
+    if (header.find("GET /health") != std::string::npos) {
+        std::string b = "{\"status\":\"ok\"}";
+        std::string r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                        std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
+        send_all(fd, r);
+        ::close(fd);
+        return;
+    }
+    if (header.find("GET /v1/models") != std::string::npos) {
+        std::string b = "{\"object\":\"list\",\"data\":[{\"id\":\"lfm3-vl-2b-mlx-4bit\",\"object\":\"model\"}]}";
+        std::string r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
+                        std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
+        send_all(fd, r);
+        ::close(fd);
+        return;
+    }
     if (header.find("POST /v1/chat/completions") == std::string::npos) {
         std::string r = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         send_all(fd, r);

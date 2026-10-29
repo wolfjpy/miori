@@ -1,5 +1,6 @@
 #include "engine.h"
 #include "ops.h"
+#include "cpu_ref.h"
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -112,7 +113,6 @@ bool Engine::init(std::string& err) {
         w_.get("language_model.model.embedding_norm.weight");
         w_.get("language_model.model.embed_tokens.weight");
         w_.get("language_model.model.embed_tokens.scales");
-        w_.get("language_model.model.embed_tokens.biases");
         wbf_ = buf(4200ull * 1024 * 1024);
         cb_ = m_.begin();
         e_ = cb_->computeCommandEncoder();
@@ -466,6 +466,8 @@ std::vector<int> Engine::generate(const std::vector<int>& prompt, const GenConfi
     auto t2 = std::chrono::steady_clock::now();
     double psec = std::chrono::duration<double>(t1 - t0).count();
     double dsec = std::chrono::duration<double>(t2 - t1).count();
+    last_prefill_s_ = psec;
+    last_decode_s_ = dsec;
     fprintf(stderr, "[prefill %zu tok %.3fs %.1f tok/s | decode %zu tok %.3fs %.1f tok/s]\n",
             prompt.size(), psec, prompt.size() / (psec + 1e-9), out.size(), dsec,
             out.size() / (dsec + 1e-9));

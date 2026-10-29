@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <algorithm>
 #include <cmath>
 #include <string>
 #include <vector>
@@ -341,6 +342,36 @@ int main(int argc, char** argv) {
         for (int i = 1; i + 1 < argc; ++i)
             if (std::string(argv[i]) == "--port") port = atoi(argv[i + 1]);
         return run_server(m, w, port);
+    } else if (cmd == "bench") {
+        Tokenizer t;
+        if (!t.load("models/tokenizer.json", err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        Engine e(m, w);
+        if (!e.init(err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        int plen = 1024, dlen = 128;
+        for (int i = 1; i + 1 < argc; ++i) {
+            if (std::string(argv[i]) == "--prefill") plen = atoi(argv[i + 1]);
+            if (std::string(argv[i]) == "--decode") dlen = atoi(argv[i + 1]);
+        }
+        std::string text;
+        while ((int)text.size() < plen * 12) text += "The quick brown fox jumps over the lazy dog. ";
+        auto ids = t.encode(text);
+        if ((int)ids.size() > plen) ids.resize(plen);
+        GenConfig cfg;
+        cfg.max_tokens = dlen;
+        cfg.temperature = 0.0f;
+        std::vector<double> ps, ds;
+        for (int r = 0; r < 3; ++r) {
+            auto out = e.generate(ids, cfg);
+            ps.push_back(e.last_prefill_s());
+            ds.push_back(e.last_decode_s());
+        }
+        std::sort(ps.begin(), ps.end());
+        std::sort(ds.begin(), ds.end());
+        const double p = ps[1], d = ds[1];
+        printf("\nbench: prompt=%zu output=%d\n", ids.size(), dlen);
+        printf("prefill: %.3f s  %.1f tok/s\n", p, ids.size() / p);
+        printf("decode:  %.3f s  %.1f tok/s  (%.1f GB/s effective)\n",
+               d, dlen / d, 1.212e9 * (dlen / d) / 1e9);
     } else if (cmd == "run") {
         Tokenizer t;
         if (!t.load("models/tokenizer.json", err)) {

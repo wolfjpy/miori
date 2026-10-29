@@ -365,4 +365,20 @@ void postnorm_add(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* x,
     e->dispatchThreadgroups(MTL::Size::Make(rows, 1, 1), MTL::Size::Make(256, 1, 1));
 }
 
+void gemv4_raw(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+               MTL::Buffer* s, MTL::Buffer* b, MTL::Buffer* x, MTL::Buffer* y,
+               uint32_t N, uint32_t K) {
+    auto p = m.pso("gemv4");
+    e->setComputePipelineState(p);
+    e->setBuffer(q, 0, 0);
+    e->setBuffer(s, 0, 1);
+    e->setBuffer(b, 0, 2);
+    e->setBuffer(x, 0, 3);
+    e->setBuffer(y, 0, 4);
+    e->setBytes(&N, sizeof(N), 5);
+    e->setBytes(&K, sizeof(K), 6);
+    e->dispatchThreadgroups(MTL::Size::Make((N + 15) / 16, 1, 1),
+                            MTL::Size::Make(512, 1, 1));
+}
+
 }  // namespace miori
