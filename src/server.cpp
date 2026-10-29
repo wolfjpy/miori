@@ -94,9 +94,9 @@ public:
         for (;;) {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [&] { return !q_.empty(); });
-            cv_.wait_for(lk, std::chrono::milliseconds(5), [&] { return q_.size() >= 4; });
+            cv_.wait_for(lk, std::chrono::milliseconds(5), [&] { return q_.size() >= (size_t)BatchEngine::kBmax; });
             std::vector<std::shared_ptr<Job>> batch;
-            while (batch.size() < 4 && !q_.empty()) {
+            while (batch.size() < (size_t)BatchEngine::kBmax && !q_.empty()) {
                 batch.push_back(q_.front());
                 q_.pop_front();
             }

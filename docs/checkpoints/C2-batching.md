@@ -168,3 +168,11 @@ plus ~1.5 ms per slot of lm_head and ~4 ms of everything else.
 
 Still missing for the original C2 gate: paged KV/block tables, continuous
 admission, batched prefill, B > 4, split-K batched attention, 64×2K/4K targets.
+
+### Negative result: B=8
+
+Extending `gemv4_b` to 8 slots (8 accumulators, 8 input rows) raised the step
+from 15.3 ms to 33.4 ms (239.6 tok/s aggregate at B=8) because of register
+pressure; B=4 remains the sweet spot at 15.3 ms / 261 tok/s. The server keeps
+Bmax=4. A 4x4 register-tiled batched GEMV or a 32-row MPP tile is the next step
+for B ≥ 8.
