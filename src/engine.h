@@ -80,6 +80,9 @@ private:
     MTL::Buffer* scores_bf_ = nullptr;
     MTL::Buffer* scratch_ = nullptr;
     MTL::Buffer* hlast_ = nullptr;
+    MTL::Buffer* pacc_ = nullptr;
+    MTL::Buffer* pm_ = nullptr;
+    MTL::Buffer* pl_ = nullptr;
     MTL::Buffer* ptokens_ = nullptr;
     MTL::Buffer* wbf_ = nullptr;
     MTL::Buffer* lm4_ = nullptr;

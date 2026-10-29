@@ -381,4 +381,36 @@ void gemv4_raw(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
                             MTL::Size::Make(512, 1, 1));
 }
 
+void attn_decode_split(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                       MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* pacc,
+                       MTL::Buffer* pm, MTL::Buffer* pl, uint32_t pos,
+                       uint32_t max_seq, uint32_t kvh, uint32_t splits) {
+    auto p = m.pso("attn_decode_split");
+    e->setComputePipelineState(p);
+    e->setBuffer(q, 0, 0);
+    e->setBuffer(kc, 0, 1);
+    e->setBuffer(vc, 0, 2);
+    e->setBuffer(pacc, 0, 3);
+    e->setBuffer(pm, 0, 4);
+    e->setBuffer(pl, 0, 5);
+    e->setBytes(&pos, sizeof(pos), 6);
+    e->setBytes(&max_seq, sizeof(max_seq), 7);
+    e->setBytes(&kvh, sizeof(kvh), 8);
+    e->setBytes(&splits, sizeof(splits), 9);
+    e->dispatchThreadgroups(MTL::Size::Make(kvh * splits, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
+void attn_combine(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* pacc,
+                  MTL::Buffer* pm, MTL::Buffer* pl, MTL::Buffer* out,
+                  uint32_t splits) {
+    auto p = m.pso("attn_combine");
+    e->setComputePipelineState(p);
+    e->setBuffer(pacc, 0, 0);
+    e->setBuffer(pm, 0, 1);
+    e->setBuffer(pl, 0, 2);
+    e->setBuffer(out, 0, 3);
+    e->setBytes(&splits, sizeof(splits), 4);
+    e->dispatchThreadgroups(MTL::Size::Make(16, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
 }  // namespace miori

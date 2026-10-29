@@ -100,5 +100,5 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ./build/miori bench --prefill 1024 --decode 128
 ```
 
-Reported on the target M6: prefill 2542 tok/s, decode 83.2 tok/s at 1K context
-(97.5 tok/s at short context), ~101 GB/s effective.
+Reported on the target M6: prefill 2542 tok/s, decode 94.1 tok/s at 1K context
+(97.5 tok/s at short context), ~114 GB/s effective.

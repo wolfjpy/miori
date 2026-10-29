@@ -105,4 +105,13 @@ void gemv4_raw(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
                MTL::Buffer* s, MTL::Buffer* b, MTL::Buffer* x, MTL::Buffer* y,
                uint32_t N, uint32_t K);
 
+void attn_decode_split(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                       MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* pacc,
+                       MTL::Buffer* pm, MTL::Buffer* pl, uint32_t pos,
+                       uint32_t max_seq, uint32_t kvh, uint32_t splits);
+
+void attn_combine(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* pacc,
+                  MTL::Buffer* pm, MTL::Buffer* pl, MTL::Buffer* out,
+                  uint32_t splits);
+
 }  // namespace miori

@@ -9,7 +9,7 @@
 | 24-layer text model + KV + conv state | working | `The capital of France is` → `Paris` |
 | 128K BPE tokenizer + LFM3 chat template | working | `test-tokenizer` |
 | MPP tensor-core prefill (bf16 cache) | 2694 tok/s @1K | `C1` |
-| 4-bit decode | 97.5 tok/s | `C1` |
+| 4-bit decode | 97.5 tok/s (short ctx), 94.1 tok/s (1K ctx, 16-way split-K) | `C1` |
 | OpenAI HTTP + SSE | working, serialized | `C3` |
 | Vision / paged KV / int8 KV / prefix cache | **not implemented** | `C2`, `C4`, `C5` |
 

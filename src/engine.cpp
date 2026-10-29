@@ -64,6 +64,9 @@ bool Engine::init(std::string& err) {
         scores_bf_ = buf(128ull * 4096 * 2);
         scratch_ = buf(15360ull * 2048 * 2);
         hlast_ = buf(2048 * 2);
+        pacc_ = buf(4ull * 16 * 4 * 128 * 4);
+        pm_ = buf(4ull * 16 * 4 * 4);
+        pl_ = buf(4ull * 16 * 4 * 4);
         ptokens_ = buf(128 * 4);
         memset(x_->contents(), 0, 2048 * 4);
         memset(gate_->contents(), 0, 16 * 4);
@@ -222,8 +225,15 @@ void Engine::attn_layer(int layer, int pos) {
             kn_, 4, 128, 1e-5f);
     rope(m_, e_, qn_, kn_, (uint32_t)pos, theta, partial);
     kv_append(m_, e_, kn_, v_, kc_[layer], vc_[layer], (uint32_t)pos, 4096, 4);
-    attn_decode(m_, e_, qn_, kc_[layer], vc_[layer], attn_, (uint32_t)pos, 4096, 4,
-                (type == 2) ? 256u : 0u);
+    if (type == 1 && pos >= 512) {
+        const uint32_t splits = 16;
+        attn_decode_split(m_, e_, qn_, kc_[layer], vc_[layer], pacc_, pm_, pl_,
+                          (uint32_t)pos, 4096, 4, splits);
+        attn_combine(m_, e_, pacc_, pm_, pl_, attn_, splits);
+    } else {
+        attn_decode(m_, e_, qn_, kc_[layer], vc_[layer], attn_, (uint32_t)pos, 4096, 4,
+                    (type == 2) ? 256u : 0u);
+    }
     gate_mul(m_, e_, attn_, gate_, agated_, 2048);
     const Tensor *oq, *os, *ob;
     uint32_t on, ok;

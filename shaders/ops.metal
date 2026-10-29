@@ -627,3 +627,80 @@ kernel void post_norm_add(device const float* x [[buffer(0)]],
     for (uint i = tid; i < n; i += 256u)
         out[ro + i] = x[ro + i] + src[ro + i] * inv * float(w[i]);
 }
+
+// ---------------------------------------------------------------- split-K decode attention
+// grid = kvh * splits; each threadgroup handles a contiguous key range.
+kernel void attn_decode_split(device const bfloat* q [[buffer(0)]],
+                              device const bfloat* kc [[buffer(1)]],
+                              device const bfloat* vc [[buffer(2)]],
+                              device float* pacc [[buffer(3)]],
+                              device float* pm [[buffer(4)]],
+                              device float* pl [[buffer(5)]],
+                              constant uint& pos [[buffer(6)]],
+                              constant uint& max_seq [[buffer(7)]],
+                              constant uint& kvh [[buffer(8)]],
+                              constant uint& splits [[buffer(9)]],
+                              uint tg [[threadgroup_position_in_grid]],
+                              uint tid [[thread_index_in_threadgroup]]) {
+    const uint h = tg / splits, sp = tg % splits;
+    const uint warp = tid / 32u, lane = tid % 32u;
+    const uint qh = h * 4u + warp;
+    const uint d0 = lane * 4u;
+    const uint keys = pos + 1u;
+    const uint chunk = (keys + splits - 1u) / splits;
+    const uint a = sp * chunk;
+    const uint b = min(keys, a + chunk);
+    float q0 = float(q[qh * 128u + d0 + 0u]);
+    float q1 = float(q[qh * 128u + d0 + 1u]);
+    float q2 = float(q[qh * 128u + d0 + 2u]);
+    float q3 = float(q[qh * 128u + d0 + 3u]);
+    float m = -INFINITY, l = 0.0f, a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (uint t = a; t < b; ++t) {
+        const ulong kb = ((ulong)h * max_seq + t) * 128u + d0;
+        float s = q0 * float(kc[kb + 0u]) + q1 * float(kc[kb + 1u]) +
+                  q2 * float(kc[kb + 2u]) + q3 * float(kc[kb + 3u]);
+        s = simd_sum(s) * 0.08838834764831845f;
+        const float nm = max(m, s);
+        const float alpha = exp(m - nm);
+        const float p = exp(s - nm);
+        l = l * alpha + p;
+        const ulong vb = ((ulong)h * 128u + d0) * max_seq + t;
+        a0 = a0 * alpha + p * float(vc[vb + 0ul * max_seq]);
+        a1 = a1 * alpha + p * float(vc[vb + 1ul * max_seq]);
+        a2 = a2 * alpha + p * float(vc[vb + 2ul * max_seq]);
+        a3 = a3 * alpha + p * float(vc[vb + 3ul * max_seq]);
+        m = nm;
+    }
+    const uint pi = (h * splits + sp) * 4u + warp;
+    const uint ai = pi * 128u + d0;
+    pm[pi] = m;
+    pl[pi] = l;
+    pacc[ai + 0u] = a0;
+    pacc[ai + 1u] = a1;
+    pacc[ai + 2u] = a2;
+    pacc[ai + 3u] = a3;
+}
+
+kernel void attn_combine(device const float* pacc [[buffer(0)]],
+                         device const float* pm [[buffer(1)]],
+                         device const float* pl [[buffer(2)]],
+                         device float* out [[buffer(3)]],
+                         constant uint& splits [[buffer(4)]],
+                         uint qh [[threadgroup_position_in_grid]],
+                         uint d [[thread_index_in_threadgroup]]) {
+    const uint h = qh / 4u, warp = qh % 4u;
+    float m = -INFINITY;
+    for (uint sp = 0; sp < splits; ++sp) m = max(m, pm[(h * splits + sp) * 4u + warp]);
+    float l = 0.0f;
+    for (uint sp = 0; sp < splits; ++sp) {
+        if (pl[(h * splits + sp) * 4u + warp] > 0.0f)
+            l += pl[(h * splits + sp) * 4u + warp] * exp(pm[(h * splits + sp) * 4u + warp] - m);
+    }
+    float acc = 0.0f;
+    for (uint sp = 0; sp < splits; ++sp) {
+        const float w = (pl[(h * splits + sp) * 4u + warp] > 0.0f)
+                            ? exp(pm[(h * splits + sp) * 4u + warp] - m) : 0.0f;
+        acc += pacc[((h * splits + sp) * 4u + warp) * 128u + d] * w;
+    }
+    out[qh * 128u + d] = (l > 0.0f) ? acc / l : 0.0f;
+}
