@@ -464,13 +464,14 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
     bool thinking = false;
     if (root.contains("chat_template_kwargs") && root["chat_template_kwargs"].contains("enable_thinking"))
         thinking = root["chat_template_kwargs"]["enable_thinking"].boolean;
+    const bool exact_req = root.contains("exact") && root["exact"].boolean;
 
     std::vector<int> out;
     size_t prompt_tokens = 0;
     GenConfig cfg;
     cfg.max_tokens = max_tokens;
     cfg.temperature = temp;
-    const bool batch_path = (temp <= 0.01f && !g_exact);
+    const bool batch_path = (temp <= 0.01f && !g_exact && !exact_req);
     const bool live_stream = stream && !batch_path && image_urls.empty();
     if (live_stream) {
         std::string h = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n"

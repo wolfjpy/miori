@@ -135,3 +135,10 @@ requests still emit SSE after generation.
 Verified: `MIORI_EXACT=1`, "What is 2+2?" -> 3 SSE events, text `4`;
 temperature 0.7, 8 tokens -> 10 SSE events, text
 "The sun is setting behind the mountains."
+
+## Per-request exact mode
+
+`{"exact": true}` on a chat request routes that request through the single
+Engine (4-bit GEMV + prefix cache) even when the process default is the batch
+path; it composes with `stream:true`. Verified: `What is 2+2?` with
+`exact:true` -> `4`.
