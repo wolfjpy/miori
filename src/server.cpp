@@ -512,6 +512,8 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
     if (root.contains("chat_template_kwargs") && root["chat_template_kwargs"].contains("enable_thinking"))
         thinking = root["chat_template_kwargs"]["enable_thinking"].boolean;
     const bool exact_req = root.contains("exact") && root["exact"].boolean;
+    int max_pixels = root.contains("max_pixels") ? (int)root["max_pixels"].as_int() : 1048576;
+    max_pixels = std::max(65536, std::min(max_pixels, 4194304));
 
     std::vector<int> out;
     size_t prompt_tokens = 0;
@@ -554,7 +556,7 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
             std::vector<uint16_t> patches;
             ImageInfo info;
             std::string ierr;
-            bool ok = preprocess_image(path, 65536, 1048576, patches, info, ierr);
+            bool ok = preprocess_image(path, 65536, max_pixels, patches, info, ierr);
             if (ok) ok = vis->encode(patches, info, f, ierr);
             ::unlink(path);
             if (!ok) {

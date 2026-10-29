@@ -201,3 +201,10 @@ Both return the same caption. Cache is in-memory only, capped at 32 images
 Image requests now stream SSE per token: the handler sends the SSE header after
 vision encode, then `Engine::decode_loop_stream` emits a delta per sampled token
 (10 events for 8 tokens in the cat test).
+
+## Per-request image resolution
+
+`max_pixels` (65536..4194304, default 1048576) is accepted in the chat request
+and passed to `preprocess_image`. Verified with `max_pixels=262144`: the cat
+image yields 240 image tokens (266 prompt tokens) instead of 992, and still
+captions correctly.
