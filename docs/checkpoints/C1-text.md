@@ -35,3 +35,11 @@ decode:  1.360 s    94.1 tok/s  (114.0 GB/s effective)
 At 1K context the decode rate drops from 97.5 (2-token context) to 94.1 because
 the decode-attention kernel launches only 4 threadgroups per layer (one per KV
 head) and is latency-bound. Split-K attention is the next step.
+
+2K context (after 16-way split-K):
+
+```
+prompt=2048 output=64
+prefill: 0.890 s  2302.4 tok/s
+decode:  0.685 s    93.4 tok/s  (113.2 GB/s effective)
+```
