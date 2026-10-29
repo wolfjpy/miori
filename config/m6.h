@@ -61,5 +61,8 @@ MIORI_CONST int kImEndId = 124900;
 MIORI_CONST int kThinkId = 124901;
 MIORI_CONST int kEndThinkId = 124902;
 MIORI_CONST int kImageId = 125030;
+MIORI_CONST int kVideoId = 125029;
+MIORI_CONST int kVisionStartId = 125009;
+MIORI_CONST int kVisionEndId = 125010;
 
 }  // namespace miori

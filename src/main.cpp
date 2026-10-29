@@ -5,6 +5,8 @@
 #include "tokenizer.h"
 #include "engine.h"
 #include "batch.h"
+#include "vision.h"
+#include "m6.h"
 #include "server.h"
 #include <chrono>
 #include <cstdio>
@@ -68,6 +70,339 @@ static void test_gemv(Metal& m, Weights& w, bool eight, bool four = false) {
     }
     printf("checked %d rows: max_abs=%.6g max_rel=%.6g  y[0]=%.6g\n",
            checked, max_abs, max_rel, gy[0]);
+}
+
+
+// ---------------------------------------------------------------- vision ----
+
+static void append_enc(const Tokenizer& t, const std::string& text, std::vector<int>& ids) {
+    auto v = t.encode(text);
+    ids.insert(ids.end(), v.begin(), v.end());
+}
+
+static void print_feature_stats(const std::vector<uint16_t>& feat, int nt) {
+    double ss = 0.0, sum = 0.0;
+    float mn = 1e30f, mx = -1e30f;
+    for (uint16_t v : feat) {
+        const float f = bf16_to_float(v);
+        ss += (double)f * f;
+        sum += f;
+        mn = std::min(mn, f);
+        mx = std::max(mx, f);
+    }
+    const double n = (double)feat.size();
+    const double mean = sum / n;
+    printf("features: %d tokens x 2048, L2=%.3f mean=%.4f std=%.4f min=%.3f max=%.3f\n", nt,
+           std::sqrt(ss), mean, std::sqrt(std::max(0.0, ss / n - mean * mean)), mn, mx);
+    for (int r = 0; r < std::min(nt, 3); ++r) {
+        double rss = 0.0;
+        for (int i = 0; i < 2048; ++i) {
+            const float f = bf16_to_float(feat[(size_t)r * 2048 + i]);
+            rss += (double)f * f;
+        }
+        printf("  token %d: L2=%.3f  ", r, std::sqrt(rss));
+        printf("first8:");
+        for (int i = 0; i < 8; ++i) printf(" %.4f", bf16_to_float(feat[(size_t)r * 2048 + i]));
+        printf("\n");
+    }
+}
+
+static void write_ppm(const std::string& path, const std::vector<uint8_t>& rgb, int w, int h) {
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) { fprintf(stderr, "vision: cannot write %s\n", path.c_str()); return; }
+    fprintf(f, "P6\n%d %d\n255\n", w, h);
+    fwrite(rgb.data(), 1, rgb.size(), f);
+    fclose(f);
+    printf("wrote resized RGB (%dx%d) to %s\n", w, h, path.c_str());
+}
+
+static bool compare_features(const std::vector<uint16_t>& gpu, const std::vector<float>& cpu,
+                             int nt, std::string& err) {
+    if (gpu.size() != cpu.size()) { err = "feature size mismatch"; return false; }
+    double worst_cos = 2.0, max_abs = 0.0;
+    int bad = 0;
+    for (int r = 0; r < nt; ++r) {
+        double dot = 0.0, ng = 0.0, nc = 0.0;
+        for (int i = 0; i < 2048; ++i) {
+            const double g = bf16_to_float(gpu[(size_t)r * 2048 + i]);
+            const double c = cpu[(size_t)r * 2048 + i];
+            if (!std::isfinite(g) || !std::isfinite(c)) { ++bad; continue; }
+            dot += g * c;
+            ng += g * g;
+            nc += c * c;
+            max_abs = std::max(max_abs, std::fabs(g - c));
+        }
+        if (ng <= 0.0 || nc <= 0.0) { ++bad; continue; }
+        const double cos = dot / (std::sqrt(ng) * std::sqrt(nc));
+        worst_cos = std::min(worst_cos, cos);
+    }
+    printf("cpu-ref: worst per-token cosine = %.6f, max |gpu-cpu| = %.5f, non-finite=%d\n",
+           worst_cos, max_abs, bad);
+    return worst_cos > 0.99 && bad == 0;
+}
+
+static void tensor_stats(const Weights& w, const char* name) {
+    const Tensor* t = w.find(name);
+    if (!t) { printf("%-52s MISSING\n", name); return; }
+    if (t->dtype != "BF16") { printf("%-52s dtype=%s\n", name, t->dtype.c_str()); return; }
+    const uint16_t* p = (const uint16_t*)t->ptr;
+    const size_t n = t->bytes() / 2;
+    double ss = 0.0, sum = 0.0;
+    float mn = 1e30f, mx = -1e30f;
+    bool bad = false;
+    for (size_t i = 0; i < n; ++i) {
+        const float v = bf16_to_float(p[i]);
+        if (!std::isfinite(v)) bad = true;
+        ss += (double)v * v; sum += v;
+        mn = std::min(mn, v); mx = std::max(mx, v);
+    }
+    printf("%-52s n=%-8zu rms=%.5f mean=%.5f min=%.4f max=%.4f%s\n", name, n,
+           std::sqrt(ss / n), sum / n, mn, mx, bad ? "  NONFINITE" : "");
+}
+
+static std::vector<uint16_t> synthetic_patches(int grid_w, int grid_h) {
+    const int n = grid_w * grid_h;
+    std::vector<uint16_t> p((size_t)n * 1536);
+    for (int i = 0; i < n; ++i) {
+        for (int c = 0; c < 1536; ++c) {
+            const float v = 0.6f * std::sin(0.013f * (c * 7 + i * 29)) +
+                            0.3f * std::cos(0.037f * (c * 3 - i * 11)) +
+                            0.05f * (float)((c % 19) - 9);
+            p[(size_t)i * 1536 + c] = float_to_bf16(v);
+        }
+    }
+    return p;
+}
+
+static std::vector<int> build_image_prompt(const Tokenizer& t, const std::string& prompt,
+                                           int n_image_tokens) {
+    std::vector<int> ids;
+    ids.push_back(kBosId);
+    ids.push_back(kImStartId);
+    append_enc(t, "system\nYou are a helpful assistant.", ids);
+    ids.push_back(kImEndId);
+    append_enc(t, "\n", ids);
+    ids.push_back(kImStartId);
+    append_enc(t, "user\n", ids);
+    ids.push_back(kVisionStartId);
+    for (int i = 0; i < n_image_tokens; ++i) ids.push_back(kImageId);
+    ids.push_back(kVisionEndId);
+    append_enc(t, prompt, ids);
+    ids.push_back(kImEndId);
+    append_enc(t, "\n", ids);
+    ids.push_back(kImStartId);
+    append_enc(t, "assistant\n", ids);
+    ids.push_back(kThinkId);
+    ids.push_back(kEndThinkId);
+    return ids;
+}
+
+static int cmd_vision_test(Metal& m, Weights& w, int argc, char** argv) {
+    std::string image;
+    int min_pixels = 65536, max_pixels = 16777216;
+    bool cpu_ref = false, text_check = false;
+    std::string dump;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--image" && i + 1 < argc) image = argv[++i];
+        else if (a == "--min-pixels" && i + 1 < argc) min_pixels = atoi(argv[++i]);
+        else if (a == "--max-pixels" && i + 1 < argc) max_pixels = atoi(argv[++i]);
+        else if (a == "--cpu-ref") cpu_ref = true;
+        else if (a == "--text-check") text_check = true;
+        else if (a == "--dump-ppm" && i + 1 < argc) dump = argv[++i];
+        else if (a == "--wstats") {
+            tensor_stats(w, "vision_tower.patchifier.weight");
+            tensor_stats(w, "vision_tower.embedding_norm.weight");
+            tensor_stats(w, "vision_tower.layers.0.conv.in_proj.weight");
+            tensor_stats(w, "vision_tower.layers.0.conv.spatial_conv.weight");
+            tensor_stats(w, "vision_tower.layers.0.conv.out_proj.weight");
+            tensor_stats(w, "vision_tower.layers.0.feed_forward.w1.weight");
+            tensor_stats(w, "vision_tower.layers.0.feed_forward.w2.weight");
+            tensor_stats(w, "vision_tower.layers.2.self_attn.q_proj.weight");
+            tensor_stats(w, "vision_tower.layers.2.self_attn.q_layernorm.weight");
+            tensor_stats(w, "vision_tower.layers.13.feed_forward.w2.weight");
+            tensor_stats(w, "multi_modal_projector.layer_norm.weight");
+            tensor_stats(w, "multi_modal_projector.layer_norm.bias");
+            tensor_stats(w, "multi_modal_projector.linear_1.weight");
+            tensor_stats(w, "multi_modal_projector.linear_1.bias");
+            tensor_stats(w, "multi_modal_projector.linear_2.weight");
+            tensor_stats(w, "multi_modal_projector.linear_2.bias");
+            return 0;
+        }
+    }
+    std::string err;
+    Vision vis(m, w);
+    if (!vis.init(err)) { fprintf(stderr, "vision: %s\n", err.c_str()); return 1; }
+
+    std::vector<uint16_t> patches;
+    ImageInfo info;
+    std::vector<uint8_t> rgb;
+    if (!preprocess_image(image, min_pixels, max_pixels, patches, info, err, dump.empty() ? nullptr : &rgb)) {
+        fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    printf("image: %s\n", image.c_str());
+    printf("  decoded %dx%d -> resized %dx%d (multiples of 32)\n", info.src_w, info.src_h,
+           info.resized_w, info.resized_h);
+    printf("  patch grid %dx%d = %d patches, %d image tokens (H/32 * W/32)\n", info.grid_w,
+           info.grid_h, info.n_patches, info.n_tokens);
+    if (!dump.empty()) write_ppm(dump, rgb, info.resized_w, info.resized_h);
+
+    std::vector<uint16_t> feats;
+    auto t0 = std::chrono::steady_clock::now();
+    if (!vis.encode(patches, info, feats, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    auto t1 = std::chrono::steady_clock::now();
+    const double sec = std::chrono::duration<double>(t1 - t0).count();
+    printf("vision encode: %.1f ms\n", sec * 1000.0);
+    print_feature_stats(feats, info.n_tokens);
+
+    if (text_check) {
+        // The additive embedding-prefill API must reproduce the text path bit
+        // for bit (multi-chunk: the prompt is > 128 tokens).
+        Tokenizer tk;
+        if (!tk.load("models/tokenizer.json", err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        Engine eng(m, w);
+        if (!eng.init(err)) { fprintf(stderr, "engine: %s\n", err.c_str()); return 1; }
+        std::string body;
+        for (int i = 0; i < 40; ++i) body += "The quick brown fox jumps over the lazy dog. ";
+        auto ids = tk.chat("You are a helpful assistant.", body, false);
+        eng.reset();
+        eng.prefill_ids(ids, true);
+        std::vector<float> la(eng.logits(), eng.logits() + 128000);
+        MTL::Buffer* emb = m.new_buffer(ids.size() * 2048 * 2);
+        eng.embed_tokens(ids.data(), (int)ids.size(), emb);
+        std::vector<uint16_t> host((size_t)ids.size() * 2048);
+        memcpy(host.data(), emb->contents(), host.size() * 2);
+        eng.reset();
+        eng.prefill_embeds(host.data(), (int)ids.size(), true);
+        std::vector<float> lb(eng.logits(), eng.logits() + 128000);
+        double md = 0.0;
+        int am_a = 0, am_b = 0;
+        for (int i = 0; i < 128000; ++i) {
+            md = std::max(md, (double)std::fabs(la[(size_t)i] - lb[(size_t)i]));
+            if (la[(size_t)i] > la[(size_t)am_a]) am_a = i;
+            if (lb[(size_t)i] > lb[(size_t)am_b]) am_b = i;
+        }
+        printf("text-check: %zu tokens (multi-chunk), max |logit(ids) - logit(embeds)| = %.6g, "
+               "argmax %d/%d\n", ids.size(), md, am_a, am_b);
+        if (md != 0.0 || am_a != am_b) {
+            fprintf(stderr, "text-check: embedding-prefill path diverges from the token path\n");
+            return 1;
+        }
+    }
+
+    if (cpu_ref) {
+        const int gw = 4, gh = 4;
+        ImageInfo ci;
+        ci.grid_w = gw;
+        ci.grid_h = gh;
+        ci.resized_w = gw * 16;
+        ci.resized_h = gh * 16;
+        ci.src_w = ci.resized_w;
+        ci.src_h = ci.resized_h;
+        ci.n_patches = gw * gh;
+        ci.n_tokens = ci.n_patches / 4;
+        auto sp = synthetic_patches(gw, gh);
+        std::vector<uint16_t> gf;
+        if (!vis.encode(sp, ci, gf, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        std::vector<float> cf;
+        auto c0 = std::chrono::steady_clock::now();
+        if (!vis.cpu_reference(sp, ci, cf, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        auto c1 = std::chrono::steady_clock::now();
+        printf("cpu-ref on synthetic %dx%d grid (%d patches): %.1f s\n", gw, gh, ci.n_patches,
+               std::chrono::duration<double>(c1 - c0).count());
+        if (!compare_features(gf, cf, ci.n_tokens, err)) {
+            fprintf(stderr, "VISION REFERENCE MISMATCH: %s\n", err.c_str());
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int cmd_vision_run(Metal& m, Weights& w, int argc, char** argv) {
+    std::string image, prompt = "Describe this image.";
+    int max_tokens = 32;
+    float temp = 0.0f;
+    int min_pixels = 65536, max_pixels = 16777216;
+    for (int i = 2; i < argc; ++i) {
+        std::string a = argv[i];
+        if (a == "--image" && i + 1 < argc) image = argv[++i];
+        else if (a == "--prompt" && i + 1 < argc) prompt = argv[++i];
+        else if (a == "--max-tokens" && i + 1 < argc) max_tokens = atoi(argv[++i]);
+        else if (a == "--temp" && i + 1 < argc) temp = (float)atof(argv[++i]);
+        else if (a == "--min-pixels" && i + 1 < argc) min_pixels = atoi(argv[++i]);
+        else if (a == "--max-pixels" && i + 1 < argc) max_pixels = atoi(argv[++i]);
+    }
+    if (image.empty()) { fprintf(stderr, "vision-run: --image <path> is required\n"); return 2; }
+    std::string err;
+    Tokenizer t;
+    if (!t.load("models/tokenizer.json", err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    Vision vis(m, w);
+    if (!vis.init(err)) { fprintf(stderr, "vision: %s\n", err.c_str()); return 1; }
+
+    std::vector<uint16_t> patches;
+    ImageInfo info;
+    if (!preprocess_image(image, min_pixels, max_pixels, patches, info, err)) {
+        fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    printf("image: %s  %dx%d -> %dx%d, grid %dx%d, %d patches, %d image tokens\n",
+           image.c_str(), info.src_w, info.src_h, info.resized_w, info.resized_h, info.grid_w,
+           info.grid_h, info.n_patches, info.n_tokens);
+
+    auto vt0 = std::chrono::steady_clock::now();
+    std::vector<uint16_t> feats;
+    if (!vis.encode(patches, info, feats, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+    auto vt1 = std::chrono::steady_clock::now();
+    const double vision_s = std::chrono::duration<double>(vt1 - vt0).count();
+    print_feature_stats(feats, info.n_tokens);
+
+    std::vector<int> ids = build_image_prompt(t, prompt, info.n_tokens);
+    if ((int)ids.size() >= 4000) {
+        fprintf(stderr, "vision-run: prompt is %zu tokens (KV capacity 4096); use --max-pixels\n",
+                ids.size());
+        return 1;
+    }
+
+    Engine e(m, w);
+    if (!e.init(err)) { fprintf(stderr, "engine: %s\n", err.c_str()); return 1; }
+
+    MTL::Buffer* emb = m.new_buffer((size_t)ids.size() * 2048 * 2);
+    e.embed_tokens(ids.data(), (int)ids.size(), emb);
+    std::vector<uint16_t> host((size_t)ids.size() * 2048);
+    memcpy(host.data(), emb->contents(), host.size() * 2);
+    int spliced = 0;
+    for (size_t i = 0; i < ids.size(); ++i) {
+        if (ids[i] != kImageId) continue;
+        if (spliced >= info.n_tokens) { fprintf(stderr, "vision-run: too many image tokens\n"); return 1; }
+        memcpy(&host[i * 2048], &feats[(size_t)spliced * 2048], 2048 * 2);
+        ++spliced;
+    }
+    if (spliced != info.n_tokens) {
+        fprintf(stderr, "vision-run: spliced %d of %d image features\n", spliced, info.n_tokens);
+        return 1;
+    }
+    printf("prompt: %zu tokens (%d image tokens spliced), vision %.1f ms\n", ids.size(), spliced,
+           vision_s * 1000.0);
+
+    GenConfig cfg;
+    cfg.max_tokens = max_tokens;
+    cfg.temperature = temp;
+    e.reset();
+    auto t0 = std::chrono::steady_clock::now();
+    e.prefill_embeds(host.data(), (int)ids.size(), true);
+    auto t1 = std::chrono::steady_clock::now();
+    auto out = e.decode_loop(cfg);
+    auto t2 = std::chrono::steady_clock::now();
+    const double psec = std::chrono::duration<double>(t1 - t0).count();
+    const double dsec = std::chrono::duration<double>(t2 - t1).count();
+    printf("prefill: %zu tok %.3fs (%.0f tok/s) | decode: %zu tok %.3fs (%.1f tok/s)\n",
+           ids.size(), psec, ids.size() / (psec + 1e-9), out.size(), dsec,
+           out.size() / (dsec + 1e-9));
+    printf("--- tokens ---\n");
+    for (int id : out) printf("%d ", id);
+    printf("\n--- output ---\n%s\n", t.decode(out).c_str());
+    return 0;
 }
 
 int main(int argc, char** argv) {
@@ -340,6 +675,10 @@ int main(int argc, char** argv) {
         printf("chat ids (%zu):", chat.size());
         for (size_t i = 0; i < chat.size() && i < 40; ++i) printf(" %d", chat[i]);
         printf("\nchat text: %s\n", t.decode(chat).c_str());
+    } else if (cmd == "vision-test") {
+        return cmd_vision_test(m, w, argc, argv);
+    } else if (cmd == "vision-run") {
+        return cmd_vision_run(m, w, argc, argv);
     } else if (cmd == "serve") {
         int port = 8080;
         for (int i = 1; i + 1 < argc; ++i)

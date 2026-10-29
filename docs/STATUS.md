@@ -11,7 +11,9 @@
 | MPP tensor-core prefill (bf16 cache) | 2694 tok/s @1K | `C1` |
 | 4-bit decode | 97.5 tok/s (short ctx), 94.1 tok/s (1K ctx, 16-way split-K) | `C1` |
 | OpenAI HTTP + SSE | working, serialized | `C3` |
-| Vision / paged KV / int8 KV | **not implemented** | `C2`, `C4` |
+| Vision tower + projector + splice | working in CLI (`vision-run`); 512² = 254 ms | `C4` |
+| Vision in HTTP API / multi-image batch | **not implemented** | `C4` |
+| Paged KV / int8 KV | **not implemented** | `C2`, `C5` |
 | Single-prefix KV cache | working in CLI and HTTP (one system slot) | `C5` |
 | Fixed-slot batch decode (Bmax=4) | working, CLI `batch-test` only | `C2` |
 
@@ -22,7 +24,8 @@
 - M2 C2: PARTIAL (fixed-slot batch decode up to 4 sequences, token-identical on
   the batched 4-bit GEMV path; no paged KV, continuous batching or server wiring).
 - M3 C3: PARTIAL (API works; 64-concurrency gate not met).
-- M4 C4: NO-GO (vision tower not executed).
+- M4 C4: GO for functionality / NO-GO for latency (captions work end to end;
+  512² vision encode 254 ms vs 40 ms gate, SIMT bf16 GEMM instead of MPP).
 - M5 C5: PARTIAL (single-prefix snapshot cache; no radix/int8/shared-prefix).
 - M6 C6: PARTIAL (kernel-level validation only).
 - M7 C7: PARTIAL (v0.1.0-core).
@@ -38,6 +41,7 @@ batching; vision tower) rather than tuning work, and were not started.
 
 1. Paged KV + ragged continuous batching on top of `BatchEngine` (C2) — unlocks
    the 高并发 targets; fixed-slot decode already works.
-2. Vision tower + projector + ImageIO (C4).
+2. Vision in the serving path: image_url/base64 input, vision queue, MPP bf16
+   GEMM for the tower (C4 latency), multi-image ragged batch.
 3. int8 KV, prefix cache, shared-prefix attention (C5).
 4. ICB replay, 24h soak, KL matrix (C5/C6).

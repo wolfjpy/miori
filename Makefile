@@ -2,7 +2,8 @@
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++20 -O2 -g -Wall -Wextra -Wno-unused-parameter \
             -Iconfig -Ithird_party/metal-cpp -Isrc
-LDFLAGS  ?= -framework Metal -framework Foundation -framework QuartzCore
+LDFLAGS  ?= -framework Metal -framework Foundation -framework QuartzCore \
+            -framework ImageIO -framework CoreGraphics -framework CoreFoundation
 METAL    ?= xcrun -sdk macosx metal -std=metal4.1 -O3 -fno-fast-math -Iconfig -Ishaders
 METALLIB ?= xcrun -sdk macosx metallib
 

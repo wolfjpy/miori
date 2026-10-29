@@ -27,6 +27,14 @@ public:
     std::vector<int> generate(const std::vector<int>& prompt, const GenConfig& cfg);
     void prefill_chunk(const int* toks, int T, int start, bool need_logits);
     void prefill_ids(const std::vector<int>& ids, bool need_logits);
+    // Additive (vision): embed a token chunk into a caller-supplied shared bf16
+    // buffer [T][2048] using the 8-bit embedding table. Chunked internally.
+    void embed_tokens(const int* toks, int T, MTL::Buffer* out);
+    // Additive (vision): prefill from a caller-supplied [T][2048] bf16
+    // embedding matrix (text embeddings with image features spliced in).
+    // Starts at pos_ and chunks internally at 128. The text-only path above is
+    // unchanged and does not use this.
+    void prefill_embeds(const uint16_t* embeds, int T, bool need_logits);
     std::vector<int> decode_loop(const GenConfig& cfg);
     std::vector<int> generate_from_state(const std::vector<int>& suffix, const GenConfig& cfg);
     void snapshot();

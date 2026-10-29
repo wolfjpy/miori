@@ -1,0 +1,119 @@
+# C4 vision — raw log, 2026-10-29T16:35:12Z, host Apple M6, 27.0.1
+
+## vision-test --cpu-ref --text-check
+weights: 732 tensors, 1.59 GB
+image: /tmp/miori-img/cat.jpg
+  decoded 1600x1598 -> resized 256x224 (multiples of 32)
+  patch grid 16x14 = 224 patches, 56 image tokens (H/32 * W/32)
+vision encode: 70.7 ms
+features: 56 tokens x 2048, L2=11.401 mean=0.0003 std=0.0337 min=-0.359 max=0.229
+  token 0: L2=1.543  first8: 0.0640 -0.0273 0.0312 0.0120 -0.0085 0.0659 -0.1045 -0.0123
+  token 1: L2=1.368  first8: 0.0547 0.0090 -0.0247 -0.0136 -0.0559 -0.0177 -0.0342 -0.0009
+  token 2: L2=1.291  first8: 0.0415 0.0060 -0.0583 -0.0082 -0.0361 0.0146 -0.0408 0.0003
+tokenizer: vocab=124893 merges=293320 specials=138
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 92.3 MB
+text-check: 423 tokens (multi-chunk), max |logit(ids) - logit(embeds)| = 0, argmax 597/597
+cpu-ref on synthetic 4x4 grid (16 patches): 1.1 s
+cpu-ref: worst per-token cosine = 0.999628, max |gpu-cpu| = 0.00608, non-finite=0
+
+## vision-run cat 1024x992
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+image: /tmp/miori-img/cat.jpg  1600x1598 -> 1024x992, grid 64x62, 3968 patches, 992 image tokens
+features: 992 tokens x 2048, L2=45.339 mean=0.0002 std=0.0318 min=-0.373 max=0.287
+  token 0: L2=1.967  first8: 0.0549 -0.0466 -0.0056 0.0250 -0.0596 -0.0215 -0.0522 0.0542
+  token 1: L2=1.512  first8: 0.0767 -0.0130 -0.0039 0.0165 -0.0679 -0.0179 -0.0679 -0.0109
+  token 2: L2=1.699  first8: 0.0664 -0.0245 -0.0248 -0.0043 -0.0708 -0.0322 -0.0781 -0.0086
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 92.3 MB
+prompt: 1020 tokens (992 image tokens spliced), vision 2028.1 ms
+prefill: 1020 tok 0.365s (2794 tok/s) | decode: 32 tok 0.332s (96.3 tok/s)
+--- tokens ---
+597 4145 3926 267 4275 6187 302 401 16441 11383 1947 5140 415 4752 5354 20 4899 5327 462 278 10903 22 440 6424 355 889 27423 20 41127 278 5140 589 
+--- output ---
+The image shows a close-up of an orange tabby cat with green eyes, looking directly at the camera. The background is blurred, highlighting the cat's
+
+## vision-run gull 1152x864
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+image: /tmp/miori-img/gull.jpg  2272x1704 -> 1152x864, grid 72x54, 3888 patches, 972 image tokens
+features: 972 tokens x 2048, L2=41.981 mean=0.0001 std=0.0298 min=-0.342 max=0.297
+  token 0: L2=1.891  first8: 0.0496 -0.0586 0.0483 0.0552 -0.0806 0.0000 -0.0596 -0.0094
+  token 1: L2=1.466  first8: 0.0496 0.0038 0.0058 -0.0096 -0.0298 0.0042 -0.0459 0.0183
+  token 2: L2=1.783  first8: 0.0306 -0.0238 -0.0156 -0.0205 -0.0391 -0.0266 -0.0574 0.0082
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 92.3 MB
+prompt: 1002 tokens (972 image tokens spliced), vision 1984.4 ms
+prefill: 1002 tok 0.367s (2734 tok/s) | decode: 40 tok 0.418s (95.7 tok/s)
+--- tokens ---
+597 4145 3926 267 4275 6187 10968 302 267 424 389 1117 589 2244 2222 267 3983 6542 11622 22 440 5353 677 3789 34366 20 267 9396 373 454 415 267 1710 2959 9131 3126 278 6973 20 309 
+--- output ---
+The image shows a close-up profile of a seagull's head against a clear blue sky. The bird has white feathers, a yellow beak with a small red spot near the tip, and
+
+## vision-run snowcat 1152x800
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+image: /tmp/miori-img/snowcat.jpg  3000x2000 -> 1248x832, grid 78x52, 4056 patches, 1014 image tokens
+features: 1014 tokens x 2048, L2=43.000 mean=0.0002 std=0.0298 min=-0.334 max=0.326
+  token 0: L2=1.930  first8: 0.0393 -0.0493 0.0282 0.0242 -0.0535 0.0256 -0.0322 -0.0131
+  token 1: L2=1.414  first8: 0.0374 0.0004 0.0085 0.0168 -0.0408 0.0075 -0.0439 -0.0349
+  token 2: L2=1.827  first8: 0.0579 0.0061 -0.0087 -0.0024 -0.0530 -0.0012 -0.0684 -0.0234
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 92.3 MB
+prompt: 1045 tokens (1014 image tokens spliced), vision 2129.3 ms
+prefill: 1045 tok 0.413s (2528 tok/s) | decode: 18 tok 0.188s (95.7 tok/s)
+--- tokens ---
+41 10299 11383 1947 5140 355 11759 1125 278 10409 20 4899 1391 5684 278 10903 22 124900 
+--- output ---
+A brown tabby cat is walking through the snow, looking back towards the camera.<|im_end|>
+
+## vision-run cat 512x480 (C4 latency case)
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+image: /tmp/miori-img/cat.jpg  1600x1598 -> 512x480, grid 32x30, 960 patches, 240 image tokens
+features: 240 tokens x 2048, L2=24.604 mean=0.0002 std=0.0351 min=-0.322 max=0.254
+  token 0: L2=2.176  first8: 0.0190 -0.0466 -0.0415 0.0134 -0.1025 0.0150 -0.1113 0.0938
+  token 1: L2=1.592  first8: 0.0615 -0.0212 -0.0141 -0.0175 -0.0723 -0.0427 -0.0762 0.0016
+  token 2: L2=1.313  first8: 0.0540 0.0012 -0.0322 -0.0162 -0.0325 0.0090 -0.0229 -0.0112
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 92.3 MB
+prompt: 266 tokens (240 image tokens spliced), vision 261.1 ms
+prefill: 266 tok 0.113s (2350 tok/s) | decode: 8 tok 0.076s (105.0 tok/s)
+--- tokens ---
+2296 16441 11383 1947 5140 415 4752 5354 
+--- output ---
+An orange tabby cat with green eyes
+
+## vision-run cat default max_pixels (1600x1600, 2500 tokens)
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+image: /tmp/miori-img/cat.jpg  1600x1598 -> 1600x1600, grid 100x100, 10000 patches, 2500 image tokens
+features: 2500 tokens x 2048, L2=66.057 mean=0.0002 std=0.0292 min=-0.381 max=0.326
+  token 0: L2=2.104  first8: 0.0332 -0.0254 0.0388 0.0046 -0.0776 0.0151 -0.0913 -0.0047
+  token 1: L2=1.427  first8: 0.0532 -0.0112 -0.0026 0.0310 -0.0288 0.0063 -0.0454 -0.0240
+  token 2: L2=1.472  first8: 0.0718 -0.0204 -0.0220 -0.0046 -0.0688 -0.0085 -0.0625 -0.0106
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 92.3 MB
+prompt: 2529 tokens (2500 image tokens spliced), vision 11008.6 ms
+prefill: 2529 tok 1.221s (2071 tok/s) | decode: 7 tok 0.067s (104.8 tok/s)
+--- tokens ---
+597 4145 3926 267 5140 22 124900 
+--- output ---
+The image shows a cat.<|im_end|>
+
+## text regression
+[prefill 1024 tok 0.366s 2794.6 tok/s | decode 32 tok 0.330s 96.9 tok/s]
+[prefill 1024 tok 0.365s 2804.4 tok/s | decode 32 tok 0.332s 96.3 tok/s]
+[prefill 1024 tok 0.364s 2812.1 tok/s | decode 32 tok 0.329s 97.3 tok/s]
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 92.3 MB
+
+bench: prompt=1024 output=32
+prefill: 0.365 s  2804.4 tok/s
+decode:  0.330 s  96.9 tok/s  (117.5 GB/s effective)
+--- output ---
+ Paris. The capital of France is Paris. The capital of
+--- 12 tokens in 0.147 s = 81.70 tok/s ---

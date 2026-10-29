@@ -14,8 +14,9 @@ No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ 
 | OpenAI-compatible HTTP + SSE | working, serialized |
 | Batch decode (fixed slots, Bmax=4) | working, CLI only |
 | Batch decode (Bmax=4) | working, server-integrated |
+| Vision tower (patchifier, 14 layers, projector) | working: `vision-run` captions photos |
+| Vision in the HTTP API / multi-image batch | **not implemented** |
 | Paged KV / continuous batching | **not implemented** |
-| Vision tower | **not implemented** |
 | int8 KV / prefix cache / shared-prefix attention | **not implemented** |
 
 Measured on the target M6/16GB (headless, 3-run median where applicable):
@@ -24,6 +25,8 @@ Measured on the target M6/16GB (headless, 3-run median where applicable):
 prefill 1002 tokens: 0.372 s = 2694 tok/s
 decode 128 tokens:   1.311 s =  97.5 tok/s  (~118 GB/s effective)
 server:              OpenAI /v1/chat/completions + SSE
+vision 512x480 image: 254 ms   (960 patches -> 240 image tokens)
+vision 1024x992 image: 2.03 s  (3968 patches -> 992 image tokens)
 ```
 
 ## Build
@@ -55,7 +58,17 @@ original 4-bit weights for decode.
 ./build/miori run --raw --prompt "The capital of France is" --max-tokens 32
 ./build/miori run --prompt "Explain RMSNorm." --max-tokens 128
 ./build/miori serve --port 8080
+
+# Vision: image tokens are spliced into the language prompt
+./build/miori vision-run --image cat.jpg --prompt "Describe this image." \
+    --max-tokens 32 --max-pixels 1048576
+./build/miori vision-test --image cat.jpg --cpu-ref    # feature stats + CPU reference
 ```
+
+`--max-pixels` bounds the smart-resized area (the processor default is
+16 777 216, i.e. up to 2 500 image tokens for a 1600×1600 image and ~11 s of
+vision compute; 1 048 576 gives 992 tokens and ~2 s). The image token count is
+always `(H/32)*(W/32)` after resize and is printed at runtime.
 
 OpenAI API:
 
@@ -75,6 +88,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ./build/miori test-prefill-attn
 ./build/miori test-conv
 ./build/miori test-tokenizer
+./build/miori vision-test --image cat.jpg --cpu-ref       # vision vs fp32 CPU reference
+./build/miori vision-test --image cat.jpg --text-check    # embed+prefill == token prefill (0 diff)
+./build/miori vision-test --image cat.jpg --dump-ppm /tmp/resized.ppm  # check preprocessing
 ./build/miori bench --prefill 1024 --decode 128
 ./build/miori batch-test --prompts "The capital of France is" "List the first four primes."
 ./build/miori batch-test --kernels gemv4 --prompts "..." "..."   # batched 4-bit GEMV path
@@ -88,8 +104,13 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   slots, sequential prefill and contiguous per-slot KV; no paged KV, no
   continuous batching. See `docs/checkpoints/C2-batching.md`.
 - No paged KV, no prefix cache, no int8 KV.
-- Vision weights are loaded but the vision tower is not executed; image inputs
-  are not yet supported by the API.
+- Vision works from the CLI only (`vision-run`, `vision-test`); the HTTP API has
+  no image input yet, there is no multi-image batch and no vision feature cache.
+- Vision latency is 6.4× off the C4 gate (254 ms for 512² vs 40 ms): the tower
+  uses the SIMT bf16 `gemm_naive` (~650 GFLOPS) rather than MPP tensor cores.
+  The bf16 vision weights would have to be tiled at load for `gemm_mpp`.
+- Vision attention materialises scores per 128-query block; memory is O(128·N)
+  but compute is still O(N²), so the processor's max_pixels default is expensive.
 - Prefill chunks are 128 tokens; the bf16 cache costs 2.93 GB of the 12.7 GB
   working set.
 - Greedy decoding is exact; temperature/top-k/top-p are implemented on the CPU.

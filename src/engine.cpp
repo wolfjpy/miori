@@ -433,6 +433,70 @@ void Engine::forward(int token, int pos, bool need_logits) {
     pos_ = pos + 1;
 }
 
+// ---- additive vision entry points -----------------------------------------
+// The two functions below are only used by the vision path. They leave the
+// text-only prefill/forward/generate code above untouched.
+
+void Engine::embed_tokens(const int* toks, int T, MTL::Buffer* out) {
+    const Tensor& eq = w_.get("language_model.model.embed_tokens.weight");
+    const Tensor& es = w_.get("language_model.model.embed_tokens.scales");
+    const Tensor& eb = w_.get("language_model.model.embed_tokens.biases");
+    // All chunks go into one command buffer, so the token ids have to live in a
+    // buffer that is not rewritten between dispatches.
+    MTL::Buffer* tb = m_.new_buffer((size_t)T * 4);
+    uint32_t* tp = (uint32_t*)tb->contents();
+    for (int i = 0; i < T; ++i) tp[i] = (uint32_t)toks[i];
+    MTL::ComputePipelineState* p = m_.pso("embed8");
+    MTL::CommandBuffer* cb = m_.begin();
+    MTL::ComputeCommandEncoder* enc = cb->computeCommandEncoder();
+    const uint32_t K = 2048;
+    int done = 0;
+    while (done < T) {
+        const int n = std::min(128, T - done);
+        enc->setComputePipelineState(p);
+        enc->setBuffer(w_.buffer(), eq.begin, 0);
+        enc->setBuffer(w_.buffer(), es.begin, 1);
+        enc->setBuffer(w_.buffer(), eb.begin, 2);
+        enc->setBuffer(tb, (NS::UInteger)((size_t)done * 4), 3);
+        enc->setBuffer(out, (NS::UInteger)((size_t)done * 2048 * 2), 4);
+        enc->setBytes(&K, sizeof(K), 5);
+        enc->dispatchThreadgroups(MTL::Size::Make(n, 1, 1), MTL::Size::Make(256, 1, 1));
+        done += n;
+    }
+    enc->endEncoding();
+    m_.submit(cb, true);
+    tb->release();
+}
+
+void Engine::prefill_embeds(const uint16_t* embeds, int T, bool need_logits) {
+    int done = 0;
+    while (done < T) {
+        const int n = std::min(128, T - done);
+        const int start = pos_;
+        memcpy(ph_->contents(), embeds + (size_t)done * 2048, (size_t)n * 2048 * 2);
+        cb_ = m_.begin();
+        e_ = cb_->computeCommandEncoder();
+        to_f32(m_, e_, ph_, px_, (uint32_t)(n * 2048));
+        for (int l = 0; l < 24; ++l) {
+            if (kLayerSuffix[l][0] == 's') p_attn(l, n, start);
+            else p_conv(l, n);
+        }
+        if (need_logits && done + n == T) {
+            const Tensor& eq = w_.get("language_model.model.embed_tokens.weight");
+            const Tensor& es = w_.get("language_model.model.embed_tokens.scales");
+            const Tensor& eb = w_.get("language_model.model.embed_tokens.biases");
+            rmsnorm(m_, e_, px_, w_, w_.get("language_model.model.embedding_norm.weight"),
+                    ph_, (uint32_t)n, 2048, 1e-5f);
+            copy_row(m_, e_, ph_, hlast_, 2048, (uint32_t)(n - 1), 2048);
+            gemv8(m_, e_, w_, eq, es, eb, hlast_, logits_, 128000, 2048);
+        }
+        e_->endEncoding();
+        m_.submit(cb_, true);
+        pos_ = start + n;
+        done += n;
+    }
+}
+
 int Engine::sample(const GenConfig& cfg) {
     const float* lg = (const float*)logits_->contents();
     if (cfg.temperature <= 0.0f) {
