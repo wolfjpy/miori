@@ -146,10 +146,6 @@ private:
     MTL::Buffer* pl_ = nullptr;
     MTL::Buffer* ptokens_ = nullptr;
     MTL::Buffer* wbf_ = nullptr;
-    MTL::Buffer* lm4_ = nullptr;
-    MTL::Buffer* lm4s_ = nullptr;
-    MTL::Buffer* lm4b_ = nullptr;
-    bool lm4_ok_ = false;
     MTL::Buffer* snap_kc_[kSnapshotSlots][24] = {};
     MTL::Buffer* snap_vc_[kSnapshotSlots][24] = {};
     MTL::Buffer* snap_cs_[kSnapshotSlots][24] = {};
