@@ -1,4 +1,6 @@
-| C2 | PARTIAL: Bmax=4 continuous-admission batch server; no paged KV/batched prefill |# STATUS — 2026-10-29
+| Multi-image request | working, sequential vision per image |
+| Ragged vision batch / queue / feature cache | **not implemented** || Multi-image request | working (sequential vision per image) | `C4` |
+| Ragged vision batch / queue / feature cache | **not implemented** | `C4` || C2 | PARTIAL: Bmax=4 continuous-admission batch server; no paged KV/batched prefill |# STATUS — 2026-10-29
 
 ## Delivered and measured
 

@@ -172,5 +172,10 @@ POST /v1/chat/completions  content=[text, image_url(data:image/jpeg;base64,...)]
 -> "The image shows a close-up of an orange tabby cat with green eyes, ..."
 ```
 
-Limitations: one image per request, no multi-image ragged batch, no vision queue
-or feature cache, fixed max_pixels in the server, video out of scope.
+Multiple image_url parts are supported and compared in one prompt (each image is
+encoded sequentially). Measured: cat + gull -> "The first image features a
+close-up of an orange tabby cat with green eyes, while the second image shows a
+seagull's head against a blue sky" (prompt_tokens 1998).
+
+Limitations: images are encoded sequentially (no ragged tower batch, no vision
+queue or feature cache), fixed max_pixels in the server, video out of scope.

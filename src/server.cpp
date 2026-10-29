@@ -100,7 +100,7 @@ static std::string b64decode(const std::string& in) {
 }
 
 static std::vector<int> image_prompt(const Tokenizer& t, const std::string& system,
-                                     const std::string& user, int n_image, bool thinking) {
+                                     const std::string& user, const std::vector<int>& counts, bool thinking) {
     std::vector<int> ids;
     ids.push_back(124894);
     const std::string sys = system.empty() ? "You are a helpful assistant." : system;
@@ -113,9 +113,11 @@ static std::vector<int> image_prompt(const Tokenizer& t, const std::string& syst
     ids.push_back(124899);
     auto b = t.encode("user\n");
     ids.insert(ids.end(), b.begin(), b.end());
-    ids.push_back(miori::kVisionStartId);
-    for (int i = 0; i < n_image; ++i) ids.push_back(miori::kImageId);
-    ids.push_back(miori::kVisionEndId);
+    for (int n_image : counts) {
+        ids.push_back(miori::kVisionStartId);
+        for (int i = 0; i < n_image; ++i) ids.push_back(miori::kImageId);
+        ids.push_back(miori::kVisionEndId);
+    }
     auto c = t.encode(user);
     ids.insert(ids.end(), c.begin(), c.end());
     ids.push_back(124900);
@@ -298,7 +300,8 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         ::close(fd);
         return;
     }
-    std::string system, user, image_url;
+    std::string system, user;
+    std::vector<std::string> image_urls;
     if (root.contains("messages")) {
         for (const auto& m : root["messages"].arr) {
             std::string role = m.contains("role") ? m["role"].str : "user";
@@ -310,7 +313,7 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
                 for (const auto& part : c.arr) {
                     if (part.contains("text") && part["text"].is_string()) text += part["text"].str;
                     else if (part.contains("image_url") && part["image_url"].contains("url"))
-                        image_url = part["image_url"]["url"].str;
+                        image_urls.push_back(part["image_url"]["url"].str);
                 }
             }
             if (role == "system") system = text;
@@ -330,30 +333,36 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
     GenConfig cfg;
     cfg.max_tokens = max_tokens;
     cfg.temperature = temp;
-    if (!image_url.empty() && vis) {
-        const size_t comma = image_url.find(',');
-        std::string b64 = comma == std::string::npos ? image_url : image_url.substr(comma + 1);
-        std::string bytes = b64decode(b64);
-        char path[] = "/tmp/miori_imgXXXXXX";
-        int fdt = mkstemp(path);
-        if (fdt < 0 || bytes.empty()) {
-            std::string r = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            send_all(fd, r); ::close(fd); return;
+    if (!image_urls.empty() && vis) {
+        std::vector<uint16_t> feats;
+        std::vector<int> counts;
+        for (const auto& url : image_urls) {
+            const size_t comma = url.find(',');
+            std::string b64 = comma == std::string::npos ? url : url.substr(comma + 1);
+            std::string bytes = b64decode(b64);
+            char path[] = "/tmp/miori_imgXXXXXX";
+            int fdt = mkstemp(path);
+            if (fdt < 0 || bytes.empty()) {
+                std::string r = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                send_all(fd, r); ::close(fd); return;
+            }
+            (void)::write(fdt, bytes.data(), bytes.size());
+            ::close(fdt);
+            std::vector<uint16_t> patches, f;
+            ImageInfo info;
+            std::string ierr;
+            bool ok = preprocess_image(path, 65536, 1048576, patches, info, ierr);
+            if (ok) ok = vis->encode(patches, info, f, ierr);
+            ::unlink(path);
+            if (!ok) {
+                fprintf(stderr, "vision: %s\n", ierr.c_str());
+                std::string r = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                send_all(fd, r); ::close(fd); return;
+            }
+            counts.push_back(info.n_tokens);
+            feats.insert(feats.end(), f.begin(), f.end());
         }
-        (void)::write(fdt, bytes.data(), bytes.size());
-        ::close(fdt);
-        std::vector<uint16_t> patches, feats;
-        ImageInfo info;
-        std::string ierr;
-        bool ok = preprocess_image(path, 65536, 1048576, patches, info, ierr);
-        if (ok) ok = vis->encode(patches, info, feats, ierr);
-        ::unlink(path);
-        if (!ok) {
-            fprintf(stderr, "vision: %s\n", ierr.c_str());
-            std::string r = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            send_all(fd, r); ::close(fd); return;
-        }
-        auto ids = image_prompt(tok, system, user, info.n_tokens, thinking);
+        auto ids = image_prompt(tok, system, user, counts, thinking);
         if (ids.size() >= 4000) {
             std::string r = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             send_all(fd, r); ::close(fd); return;
@@ -367,13 +376,14 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
         memcpy(host.data(), emb->contents(), host.size() * 2);
         emb->release();
         int spliced = 0;
+        const int total_feats = (int)(feats.size() / 2048);
         for (size_t i = 0; i < ids.size(); ++i) {
             if (ids[i] != miori::kImageId) continue;
-            if (spliced >= info.n_tokens) break;
+            if (spliced >= total_feats) break;
             memcpy(&host[i * 2048], &feats[(size_t)spliced * 2048], 2048 * 2);
             ++spliced;
         }
-        if (spliced != info.n_tokens) {
+        if (spliced != total_feats) {
             std::string r = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             send_all(fd, r); ::close(fd); return;
         }
@@ -384,6 +394,7 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCa
             out = eng.decode_loop(cfg);
         }
         prompt_tokens = ids.size();
+    } else if (temp <= 0.01f) {
     } else if (temp <= 0.01f) {
         // Greedy requests go through the 4-slot batch decoder.
         auto job = std::make_shared<Job>();

@@ -1,4 +1,6 @@
-# Miori
+| Multi-image request | working, sequential vision per image |
+| Ragged vision batch / queue / feature cache | **not implemented** || Multi-image request | working (sequential vision per image) | `C4` |
+| Ragged vision batch / queue / feature cache | **not implemented** | `C4` |# Miori
 
 Metal + C++20 inference engine for `LiquidAI/LFM3-VL-2B-MLX-4bit` on Apple M6 / 16 GB.
 No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ host.
