@@ -1,7 +1,4 @@
-| Vision feature cache | working, 32-entry LRU |
-| Ragged vision batch / queue | **not implemented** || Multi-image request | working, sequential vision per image |
-| Ragged vision batch / queue / feature cache | **not implemented** || Multi-image request | working (sequential vision per image) | `C4` |
-| Ragged vision batch / queue / feature cache | **not implemented** | `C4` |# Miori
+# Miori
 
 Metal + C++20 inference engine for `LiquidAI/LFM3-VL-2B-MLX-4bit` on Apple M6 / 16 GB.
 No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ host.
@@ -22,7 +19,8 @@ No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ 
 | Vision in the HTTP API | working, one base64 image per request |
 | Multi-image batch / vision queue | **not implemented** |
 | Paged KV / continuous batching | **not implemented** |
-| int8 KV / prefix cache / shared-prefix attention | **not implemented** |
+| int8 KV (opt-in) | working behind `MIORI_KV_INT8=1`: Engine + BatchEngine, decode/prefill/snapshot; KV bytes halved (2.95 GB → 1.50 GB at Bmax=32); PPL +0.31 %, top-1 99.12 % (misses the 99.5 % strict gate, so bf16 is default) |
+| Shared-prefix attention / radix cache | **not implemented** |
 
 Measured on the target M6/16GB (headless, 3-run median where applicable):
 
@@ -103,6 +101,8 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ./build/miori test-mpp-tile          # 32- vs 64-row MPP tile numerics (bit-identical)
 ./build/miori batch-prefill-test     # 64 packed prompts vs sequential prefill: timing + logits/KV diff
 ./build/miori batch-prefill-test --n 64 --repeat 3 --state-check 4 --long 423 [--words]
+./build/miori test-kv-int8          # int8 KV writers/attention/prefill GEMM vs CPU reference
+./build/miori kv-int8-test --file docs/README.md --tokens 1024  # bf16 vs int8 quality gate
 ```
 
 ## Known limitations
@@ -113,7 +113,10 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   continuous batching. Packed prefill covers up to 32 requests / 1024 tokens per
   pass (`MIORI_BATCH_PREFILL` in the server, on by default; set `=0` to disable); longer prompts
   fall back to the sequential prefill. See `docs/checkpoints/C2-batching.md`.
-- No paged KV, no prefix cache, no int8 KV.
+- No paged KV and no shared-prefix/radix cache (only 4 full-prefix snapshots).
+  The optional int8 KV (`MIORI_KV_INT8=1`) halves KV memory but misses the
+  project's 99.5 % top-1 gate (99.12 % aggregate, PPL +0.31 %), so bf16 is the
+  default; see `docs/checkpoints/C5-int8-kv.md`.
 - Vision works from the CLI only (`vision-run`, `vision-test`); the HTTP API has
   no image input yet, there is no multi-image batch and no vision feature cache.
 - Vision attention still materialises the 16 × N² score matrices (about 2 GB of
@@ -166,4 +169,7 @@ first tokens 64/64 identical, first-token logits 0/8192000 differ, KV+conv state
 
 ```bash
 ./build/miori ppl --file /tmp/en.txt --tokens 200
+./build/miori ppl --file docs/README.md --tokens 1024 --kv-int8   # int8 KV PPL
+./build/miori kv-int8-test --file docs/README.md --tokens 1024  # bf16 vs int8: PPL/top-1/KL + 4K decode
+./build/miori test-kv-int8                                      # int8 KV kernels vs CPU reference
 ```

@@ -1,5 +1,6 @@
-| C5 prefix | working (4-prefix LRU) |# STATUS — 2026-10-29
+# STATUS — 2026-10-29
 - C2: PARTIAL — packed multi-request prefill landed (64 x 23-token prompts 2.10 s -> 0.67 s, bit-identical, server default); still no paged KV or continuous batching.
+- C5: PARTIAL — optional int8 KV (`MIORI_KV_INT8=1`) is implemented end to end (single Engine + BatchEngine, prefill/decode/snapshot), halving KV memory; it misses the strict 99.5 % top-1 gate (99.12 % aggregate, PPL +0.31 %), so bf16 stays the default. See `docs/checkpoints/C5-int8-kv.md`.
 
 ## Delivered and measured
 
@@ -16,8 +17,9 @@
 | Vision on MPP tensor cores | 8.2× vs SIMT: 261 → 32 ms (512²), 2028 → 271 ms (1024²) | `C4` |
 | Vision in HTTP API | working (one base64 image per request) | `C4` |
 | Multi-image batch / vision queue | **not implemented** | `C4` |
-| Paged KV / int8 KV | **not implemented** | `C2`, `C5` |
-| Single-prefix KV cache | working in CLI and HTTP (one system slot) | `C5` |
+| Paged KV | **not implemented** | `C2` |
+| int8 KV (opt-in `MIORI_KV_INT8=1`) | working: Engine + BatchEngine, decode/prefill/snapshot; 50.8 % KV bytes; PPL +0.31 %, top-1 99.12 % (strict 99.5 % gate missed) | `C5-int8-kv` |
+| 4-prefix KV snapshot cache | working in CLI and HTTP (LRU by system prompt) | `C5` |
 | Fixed-slot batch decode (Bmax=32) | working, server-integrated (hybrid 1 / B=32) | `C2` |
 | Packed multi-request prefill | working: 64 x 23-token prompts 2.10 s -> 0.67 s (3.13x), first-token logits / KV / conv state bit-identical | `C2` |
 
@@ -33,7 +35,10 @@
 - M4 C4: GO — captions end to end (CPU cosine 0.9997), 512² 32 ms warm vs the
   40 ms gate, 1024² 271 ms vs 600 ms. Not wired into the HTTP API and no
   multi-image batch; fused flash attention would remove the remaining N² traffic.
-- M5 C5: PARTIAL (single-prefix snapshot cache; no radix/int8/shared-prefix).
+- M5 C5: PARTIAL — 4-prefix snapshot cache and an optional int8 KV cache are
+  implemented; int8 passes PPL/KL gates but misses the 99.5 % top-1 gate
+  (99.12 % aggregate), so it is opt-in and bf16 remains default. No radix or
+  shared-prefix cache.
 - M6 C6: PARTIAL (kernel-level validation only).
 - M7 C7: PARTIAL (v0.1.0-core).
 
@@ -52,5 +57,6 @@ batching; vision tower) rather than tuning work, and were not started.
    4-bit batched GEMV path back to a usable B ≤ 4 mode.
 2. Vision in the serving path: image_url/base64 input, vision queue, MPP bf16
    GEMM for the tower (C4 latency), multi-image ragged batch.
-3. int8 KV, prefix cache, shared-prefix attention (C5).
+3. int8 KV quality headroom: group-wise scales / mixed K-V precision to clear
+   the 99.5 % top-1 gate, then radix and shared-prefix attention (C5).
 4. ICB replay, 24h soak, KL matrix (C5/C6).

@@ -1,0 +1,5 @@
+weights: 732 tensors, 1.59 GB
+test-kv-int8: prefill (T=4, seq=4) QK raw score err = 0, PV max abs err = 0
+test-kv-int8: decode (pos=600) max abs err = 1.01328e-06, split-K(16) = 1.07288e-06
+test-kv-int8: max quantisation error / token max_abs: K 0.778%, V 0.754% (1/127 = 0.79%)
+test-kv-int8: PASS

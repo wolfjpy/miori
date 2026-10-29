@@ -1,0 +1,13 @@
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 92.3 MB (bf16)
+
+kv-int8-test: docs/README.md, 1885 positions (128 KL sample(s))
+KV bytes: Engine 92.27 MB -> 46.86 MB (50.8%); modelled BatchEngine Bmax=32 2952.8 MB -> 1499.5 MB (50.8%)
+PPL: bf16 19.7301 -> int8 19.7691 (delta +0.198%)
+top-1 agreement: 1867/1885 = 99.045%
+KL(ref||int8) over 128 positions: mean 0.000320887, p99 0.0018751, max 0.00246448; mean |dlogit| 0.02216
+modelled attention KV read/token @4K: 369.1 MB bf16 -> 184.5 MB int8
+quality gate (docs/CHECKPOINTS.md 3.4: top-1 >= 99.5%, mean KL <= 1e-3, p99 KL <= 5e-3): FAIL
+task target (PPL delta <= +2%, top-1 >= 99%): PASS

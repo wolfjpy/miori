@@ -646,5 +646,179 @@ void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
     e->dispatchThreadgroups(MTL::Size::Make(N / 64, (M + 31) / 32, 1), MTL::Size::Make(128, 1, 1));
 }
 
+// ---- optional int8 KV -------------------------------------------------------
+
+void kv_append_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                  MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                  MTL::Buffer* ks, MTL::Buffer* vs, uint32_t pos, uint32_t max_seq,
+                  uint32_t kvh) {
+    auto p = m.pso("kv_append_i8");
+    e->setComputePipelineState(p);
+    e->setBuffer(k, 0, 0);
+    e->setBuffer(v, 0, 1);
+    e->setBuffer(kc, 0, 2);
+    e->setBuffer(vc, 0, 3);
+    e->setBuffer(ks, 0, 4);
+    e->setBuffer(vs, 0, 5);
+    e->setBytes(&pos, sizeof(pos), 6);
+    e->setBytes(&max_seq, sizeof(max_seq), 7);
+    e->dispatchThreadgroups(MTL::Size::Make(kvh, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
+void kv_write_b_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                   MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                   MTL::Buffer* ks, MTL::Buffer* vs, uint32_t T, uint32_t start,
+                   uint32_t max_seq) {
+    auto p = m.pso("kv_write_b_i8");
+    e->setComputePipelineState(p);
+    e->setBuffer(k, 0, 0);
+    e->setBuffer(v, 0, 1);
+    e->setBuffer(kc, 0, 2);
+    e->setBuffer(vc, 0, 3);
+    e->setBuffer(ks, 0, 4);
+    e->setBuffer(vs, 0, 5);
+    e->setBytes(&start, sizeof(start), 6);
+    e->setBytes(&max_seq, sizeof(max_seq), 7);
+    e->dispatchThreadgroups(MTL::Size::Make(T * 4u, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
+void attn_decode_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                    MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* ks,
+                    MTL::Buffer* vs, MTL::Buffer* out, uint32_t pos, uint32_t max_seq,
+                    uint32_t kvh, uint32_t window) {
+    auto p = m.pso("attn_decode_i8");
+    e->setComputePipelineState(p);
+    e->setBuffer(q, 0, 0);
+    e->setBuffer(kc, 0, 1);
+    e->setBuffer(vc, 0, 2);
+    e->setBuffer(ks, 0, 3);
+    e->setBuffer(vs, 0, 4);
+    e->setBuffer(out, 0, 5);
+    e->setBytes(&pos, sizeof(pos), 6);
+    e->setBytes(&max_seq, sizeof(max_seq), 7);
+    e->setBytes(&kvh, sizeof(kvh), 8);
+    e->setBytes(&window, sizeof(window), 9);
+    e->dispatchThreadgroups(MTL::Size::Make(kvh, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
+void attn_decode_split_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                          MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* ks,
+                          MTL::Buffer* vs, MTL::Buffer* pacc, MTL::Buffer* pm,
+                          MTL::Buffer* pl, uint32_t pos, uint32_t max_seq, uint32_t kvh,
+                          uint32_t splits) {
+    auto p = m.pso("attn_decode_split_i8");
+    e->setComputePipelineState(p);
+    e->setBuffer(q, 0, 0);
+    e->setBuffer(kc, 0, 1);
+    e->setBuffer(vc, 0, 2);
+    e->setBuffer(ks, 0, 3);
+    e->setBuffer(vs, 0, 4);
+    e->setBuffer(pacc, 0, 5);
+    e->setBuffer(pm, 0, 6);
+    e->setBuffer(pl, 0, 7);
+    e->setBytes(&pos, sizeof(pos), 8);
+    e->setBytes(&max_seq, sizeof(max_seq), 9);
+    e->setBytes(&kvh, sizeof(kvh), 10);
+    e->setBytes(&splits, sizeof(splits), 11);
+    e->dispatchThreadgroups(MTL::Size::Make(kvh * splits, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
+void gemm_naive_qk_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
+                      MTL::Buffer* B, MTL::Buffer* bs, MTL::Buffer* C, uint32_t M,
+                      uint32_t N, uint32_t K, uint32_t lda, uint32_t ldb, uint32_t ldc,
+                      uint32_t aoff, uint32_t boff, uint32_t bsoff, uint32_t coff) {
+    auto p = m.pso("gemm_naive_qk_i8");
+    e->setComputePipelineState(p);
+    e->setBuffer(A, aoff, 0);
+    e->setBuffer(B, boff, 1);
+    e->setBuffer(bs, bsoff, 2);
+    e->setBuffer(C, coff, 3);
+    e->setBytes(&M, sizeof(M), 4);
+    e->setBytes(&N, sizeof(N), 5);
+    e->setBytes(&K, sizeof(K), 6);
+    e->setBytes(&lda, sizeof(lda), 7);
+    e->setBytes(&ldb, sizeof(ldb), 8);
+    e->setBytes(&ldc, sizeof(ldc), 9);
+    e->dispatchThreadgroups(MTL::Size::Make((N + 63) / 64, (M + 63) / 64, 1),
+                            MTL::Size::Make(16, 16, 1));
+}
+
+void gemm_naive_pv_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
+                      MTL::Buffer* B, MTL::Buffer* bs, MTL::Buffer* C, uint32_t M,
+                      uint32_t N, uint32_t K, uint32_t lda, uint32_t ldb, uint32_t ldc,
+                      uint32_t aoff, uint32_t boff, uint32_t bsoff, uint32_t coff) {
+    auto p = m.pso("gemm_naive_pv_i8");
+    e->setComputePipelineState(p);
+    e->setBuffer(A, aoff, 0);
+    e->setBuffer(B, boff, 1);
+    e->setBuffer(bs, bsoff, 2);
+    e->setBuffer(C, coff, 3);
+    e->setBytes(&M, sizeof(M), 4);
+    e->setBytes(&N, sizeof(N), 5);
+    e->setBytes(&K, sizeof(K), 6);
+    e->setBytes(&lda, sizeof(lda), 7);
+    e->setBytes(&ldb, sizeof(ldb), 8);
+    e->setBytes(&ldc, sizeof(ldc), 9);
+    e->dispatchThreadgroups(MTL::Size::Make((N + 63) / 64, (M + 63) / 64, 1),
+                            MTL::Size::Make(16, 16, 1));
+}
+
+void kv_append_b_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                    MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                    MTL::Buffer* ks, MTL::Buffer* vs, MTL::Buffer* positions,
+                    uint32_t B, uint32_t max_seq, uint32_t kvh) {
+    auto p = m.pso("kv_append_b_i8");
+    e->setComputePipelineState(p);
+    e->setBuffer(k, 0, 0);
+    e->setBuffer(v, 0, 1);
+    e->setBuffer(kc, 0, 2);
+    e->setBuffer(vc, 0, 3);
+    e->setBuffer(ks, 0, 4);
+    e->setBuffer(vs, 0, 5);
+    e->setBuffer(positions, 0, 6);
+    e->setBytes(&max_seq, sizeof(max_seq), 7);
+    e->setBytes(&kvh, sizeof(kvh), 8);
+    e->dispatchThreadgroups(MTL::Size::Make(B * kvh, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
+void attn_decode_b_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                      MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* ks,
+                      MTL::Buffer* vs, MTL::Buffer* out, MTL::Buffer* positions,
+                      uint32_t B, uint32_t max_seq, uint32_t kvh, uint32_t window) {
+    auto p = m.pso("attn_decode_b_i8");
+    e->setComputePipelineState(p);
+    e->setBuffer(q, 0, 0);
+    e->setBuffer(kc, 0, 1);
+    e->setBuffer(vc, 0, 2);
+    e->setBuffer(ks, 0, 3);
+    e->setBuffer(vs, 0, 4);
+    e->setBuffer(out, 0, 5);
+    e->setBuffer(positions, 0, 6);
+    e->setBytes(&max_seq, sizeof(max_seq), 7);
+    e->setBytes(&kvh, sizeof(kvh), 8);
+    e->setBytes(&window, sizeof(window), 9);
+    e->dispatchThreadgroups(MTL::Size::Make(B * kvh, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
+void kv_write_packed_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                        MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                        MTL::Buffer* ks, MTL::Buffer* vs, MTL::Buffer* slots,
+                        MTL::Buffer* positions, uint32_t T, uint32_t max_seq,
+                        uint32_t kvh) {
+    auto p = m.pso("kv_write_packed_i8");
+    e->setComputePipelineState(p);
+    e->setBuffer(k, 0, 0);
+    e->setBuffer(v, 0, 1);
+    e->setBuffer(kc, 0, 2);
+    e->setBuffer(vc, 0, 3);
+    e->setBuffer(ks, 0, 4);
+    e->setBuffer(vs, 0, 5);
+    e->setBuffer(slots, 0, 6);
+    e->setBuffer(positions, 0, 7);
+    e->setBytes(&max_seq, sizeof(max_seq), 8);
+    e->setBytes(&kvh, sizeof(kvh), 9);
+    e->dispatchThreadgroups(MTL::Size::Make(T * 4u, 1, 1), MTL::Size::Make(128, 1, 1));
+}
+
 
 }  // namespace miori

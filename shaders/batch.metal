@@ -269,3 +269,144 @@ kernel void gather_rows(device const bfloat* src [[buffer(0)]],
     device bfloat* d = dst + (ulong)tg * K;
     for (uint i = tid; i < K; i += 256u) d[i] = s[i];
 }
+
+// ============================================================ int8 KV (batch)
+// Same layout as the single-sequence int8 cache with a leading slot dimension:
+//   K: [B][kvh][max_seq][128] int8, ks: [B][kvh][max_seq] bf16
+//   V: [B][kvh][128][max_seq] int8, vs: [B][kvh][max_seq] bf16
+// Scales are per (slot, kv_head, token); no zero point.
+
+static inline float kvb_absmax(threadgroup float* sh, float v, uint lane, uint warp) {
+    v = simd_max(v);
+    if (lane == 0u) sh[warp] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return max(max(sh[0], sh[1]), max(sh[2], sh[3]));
+}
+
+// One token per slot at positions[slot]; grid = B*kvh threadgroups of 128 threads.
+kernel void kv_append_b_i8(device const bfloat* k [[buffer(0)]],
+                           device const float* v [[buffer(1)]],
+                           device char* kc [[buffer(2)]],
+                           device char* vc [[buffer(3)]],
+                           device bfloat* ks [[buffer(4)]],
+                           device bfloat* vs [[buffer(5)]],
+                           device const uint* positions [[buffer(6)]],
+                           constant uint& max_seq [[buffer(7)]],
+                           constant uint& kvh [[buffer(8)]],
+                           uint tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]],
+                           uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint slot = tg / kvh, h = tg % kvh;
+    const uint d = tid;
+    const uint pos = positions[slot];
+    const ulong src = (ulong)slot * 512ul + h * 128u + d;
+    const float kv = float(k[src]);
+    const float vv = v[src];
+    threadgroup float mk[4], mv[4];
+    const float kmax = kvb_absmax(mk, fabs(kv), lane, warp);
+    const float vmax = kvb_absmax(mv, fabs(vv), lane, warp);
+    const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
+    const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
+    const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
+    const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
+    const ulong kbase = ((ulong)slot * kvh + h) * max_seq;
+    kc[(kbase + pos) * 128ul + d] = (char)kq;
+    vc[(((ulong)slot * kvh + h) * 128ul + d) * max_seq + pos] = (char)vq;
+    if (tid == 0u) {
+        ks[kbase + pos] = bfloat(kscale);
+        vs[kbase + pos] = bfloat(vscale);
+    }
+}
+
+// Packed [T][512] prefill rows -> per-request slot/position; grid = T*kvh.
+kernel void kv_write_packed_i8(device const bfloat* k [[buffer(0)]],
+                               device const float* v [[buffer(1)]],
+                               device char* kc [[buffer(2)]],
+                               device char* vc [[buffer(3)]],
+                               device bfloat* ks [[buffer(4)]],
+                               device bfloat* vs [[buffer(5)]],
+                               device const uint* slots [[buffer(6)]],
+                               device const uint* positions [[buffer(7)]],
+                               constant uint& max_seq [[buffer(8)]],
+                               constant uint& kvh [[buffer(9)]],
+                               uint tg [[threadgroup_position_in_grid]],
+                               uint tid [[thread_index_in_threadgroup]],
+                               uint lane [[thread_index_in_simdgroup]],
+                               uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint t = tg / kvh, h = tg % kvh;
+    const uint d = tid;
+    const uint slot = slots[t], pos = positions[t];
+    const ulong src = (ulong)t * 512ul + h * 128u + d;
+    const float kv = float(k[src]);
+    const float vv = v[src];
+    threadgroup float mk[4], mv[4];
+    const float kmax = kvb_absmax(mk, fabs(kv), lane, warp);
+    const float vmax = kvb_absmax(mv, fabs(vv), lane, warp);
+    const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
+    const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
+    const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
+    const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
+    const ulong kbase = ((ulong)slot * kvh + h) * max_seq;
+    kc[(kbase + pos) * 128ul + d] = (char)kq;
+    vc[(((ulong)slot * kvh + h) * 128ul + d) * max_seq + pos] = (char)vq;
+    if (tid == 0u) {
+        ks[kbase + pos] = bfloat(kscale);
+        vs[kbase + pos] = bfloat(vscale);
+    }
+}
+
+// int8 batch decode attention: grid = B*kvh threadgroups, 4 warps = 4 q heads.
+kernel void attn_decode_b_i8(device const bfloat* q [[buffer(0)]],
+                             device const char* kc [[buffer(1)]],
+                             device const char* vc [[buffer(2)]],
+                             device const bfloat* ks [[buffer(3)]],
+                             device const bfloat* vs [[buffer(4)]],
+                             device float* out [[buffer(5)]],
+                             device const uint* positions [[buffer(6)]],
+                             constant uint& max_seq [[buffer(7)]],
+                             constant uint& kvh [[buffer(8)]],
+                             constant uint& window [[buffer(9)]],
+                             uint tg [[threadgroup_position_in_grid]],
+                             uint tid [[thread_index_in_threadgroup]]) {
+    const uint slot = tg / kvh, h = tg % kvh;
+    const uint warp = tid / 32u, lane = tid % 32u;
+    const uint qh = h * 4u + warp;
+    const uint d0 = lane * 4u;
+    device const bfloat* qs = q + (ulong)slot * 2048ul;
+    device const char* ks8 = kc + ((ulong)slot * kvh + h) * (ulong)max_seq * 128ul;
+    device const char* vs8 = vc + ((ulong)slot * kvh + h) * 128ul * (ulong)max_seq;
+    device const bfloat* ksc = ks + ((ulong)slot * kvh + h) * (ulong)max_seq;
+    device const bfloat* vsc = vs + ((ulong)slot * kvh + h) * (ulong)max_seq;
+    const uint pos = positions[slot];
+    const uint keys = pos + 1u;
+    const uint start = (window && keys > window) ? keys - window : 0u;
+    float q0 = float(qs[qh * 128u + d0 + 0u]);
+    float q1 = float(qs[qh * 128u + d0 + 1u]);
+    float q2 = float(qs[qh * 128u + d0 + 2u]);
+    float q3 = float(qs[qh * 128u + d0 + 3u]);
+    float m = -INFINITY, l = 0.0f, a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    for (uint t = start; t < keys; ++t) {
+        const ulong kb = (ulong)t * 128ul + d0;
+        float s = q0 * float(ks8[kb + 0u]) + q1 * float(ks8[kb + 1u]) +
+                  q2 * float(ks8[kb + 2u]) + q3 * float(ks8[kb + 3u]);
+        s = simd_sum(s) * float(ksc[t]) * 0.08838834764831845f;
+        const float nm = max(m, s);
+        const float alpha = exp(m - nm);
+        const float p = exp(s - nm);
+        l = l * alpha + p;
+        const float vscale = float(vsc[t]);
+        const ulong vb = (ulong)d0 * (ulong)max_seq + t;
+        a0 = a0 * alpha + p * float(vs8[vb + 0ul * max_seq]) * vscale;
+        a1 = a1 * alpha + p * float(vs8[vb + 1ul * max_seq]) * vscale;
+        a2 = a2 * alpha + p * float(vs8[vb + 2ul * max_seq]) * vscale;
+        a3 = a3 * alpha + p * float(vs8[vb + 3ul * max_seq]) * vscale;
+        m = nm;
+    }
+    const float inv = 1.0f / l;
+    device float* o = out + (ulong)slot * 2048ul + qh * 128u + d0;
+    o[0u] = a0 * inv;
+    o[1u] = a1 * inv;
+    o[2u] = a2 * inv;
+    o[3u] = a3 * inv;
+}

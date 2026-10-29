@@ -42,6 +42,9 @@ public:
                                                const std::function<void(int)>& cb);
     std::vector<int> decode_loop_stream(const GenConfig& cfg, const std::function<void(int)>& cb);
     static constexpr int kSnapshotSlots = 4;
+    static constexpr int kKvHeads = 4;
+    static constexpr int kHeadDim = 128;
+    static constexpr int kMaxSeq = 4096;
     void snapshot(int slot = 0);
     void restore(int slot = 0);
     bool has_snapshot(int slot = 0) const { return has_snapshot_[slot]; }
@@ -49,6 +52,20 @@ public:
     void reset();
     const float* logits() const;
     int pos() const { return pos_; }
+
+    // ---- optional int8 KV (MIORI_KV_INT8=1) -------------------------------
+    // bf16 remains the default. The format is fixed per Engine at init from the
+    // environment; set_kv_int8() switches at runtime for the comparison
+    // harness (it allocates the other format lazily and does not migrate data,
+    // so callers must reset/refill).
+    bool kv_int8() const { return kv_i8_; }
+    bool set_kv_int8(bool on, std::string& err);
+    // Live KV bytes for the active format (11 attention layers; scales included).
+    size_t kv_cache_bytes() const;
+    MTL::Buffer* kv_k8(int layer) const;       // int8 [4][4096][128], null if bf16
+    MTL::Buffer* kv_v8(int layer) const;       // int8 [4][128][4096], null if bf16
+    MTL::Buffer* kv_ks(int layer) const;       // bf16 [4][4096]
+    MTL::Buffer* kv_vs(int layer) const;       // bf16 [4][4096]
 
     // ---- additive accessors for the C2 batch path -------------------------
     // The single-sequence API above is unchanged; these only expose the state
@@ -126,12 +143,21 @@ private:
     MTL::Buffer* snap_kc_[kSnapshotSlots][24] = {};
     MTL::Buffer* snap_vc_[kSnapshotSlots][24] = {};
     MTL::Buffer* snap_cs_[kSnapshotSlots][24] = {};
+    MTL::Buffer* snap_kc8_[kSnapshotSlots][24] = {};
+    MTL::Buffer* snap_vc8_[kSnapshotSlots][24] = {};
+    MTL::Buffer* snap_ks8_[kSnapshotSlots][24] = {};
+    MTL::Buffer* snap_vs8_[kSnapshotSlots][24] = {};
     int snap_pos_[kSnapshotSlots] = {};
     bool has_snapshot_[kSnapshotSlots] = {};
     std::unordered_map<std::string, uint32_t> woff_;
     uint32_t wbf_used_ = 0;
     MTL::Buffer* kc_[24] = {};
     MTL::Buffer* vc_[24] = {};
+    MTL::Buffer* kc8_[24] = {};
+    MTL::Buffer* vc8_[24] = {};
+    MTL::Buffer* ks8_[24] = {};
+    MTL::Buffer* vs8_[24] = {};
+    bool kv_i8_ = false;
     MTL::Buffer* cs_[24][2] = {};
     int cs_cur_[24] = {};
     MTL::CommandBuffer* cb_ = nullptr;
@@ -154,6 +180,8 @@ private:
     void p_ffn(int layer, int T);
     void p_post(int layer, const char* norm_name, MTL::Buffer* src, int T);
     void post_norm_add(int layer, const char* norm_name, MTL::Buffer* src);
+    bool alloc_bf16_kv(std::string& err);
+    bool alloc_int8_kv(std::string& err);
 };
 
 }  // namespace miori

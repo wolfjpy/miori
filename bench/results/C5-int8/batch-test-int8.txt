@@ -1,0 +1,22 @@
+[prefill 27 tok 0.036s 753.3 tok/s | decode 3 tok 0.021s 140.4 tok/s]
+[prefill 28 tok 0.033s 843.6 tok/s | decode 16 tok 0.163s 98.3 tok/s]
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 46.9 MB (int8 + per-head/token bf16 scales)
+batch: Bmax=32, slot KV 1499.5 MB total (int8), conv state 40.9 MB, logits 16.4 MB
+batch: packed prefill rows=1024 (175.4 MB activations), chunk=128
+seq 0: 27 prompt tokens, 3 generated
+  ref: 41176 22 124900
+  bat: 41176 22 124900
+seq 1: 28 prompt tokens, 16 generated
+  ref: 597 1008 2258 91422 437 229 26 20 229 27 20 229 29 20 309 229
+  bat: 597 1008 2258 91422 437 229 26 20 229 27 20 229 29 20 309 229
+
+batch-test: B=2 (Bmax=32), max_tokens=16, kernels=gemm_mpp(bf16)
+prefill (sequential Engine): 0.067 s
+reference single-stream decode: 17 forwards in 0.184 s = 92.4 tok/s
+batch decode: 15 steps, 17 tokens in 0.233 s = 73.0 tok/s aggregate (15.52 ms/step)
+tokens compared: 19, mismatches: 0
+aggregate speedup vs sequential single-stream: 0.79x
+RESULT: token-identical to single-sequence greedy

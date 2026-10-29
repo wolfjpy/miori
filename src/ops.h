@@ -206,4 +206,65 @@ void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
                 MTL::Buffer* B, MTL::Buffer* C, uint32_t M, uint32_t N, uint32_t K,
                 uint32_t boff = 0);
 
+// ---- optional symmetric int8 KV cache (MIORI_KV_INT8=1) --------------------
+//
+// K: int8 [h][max_seq][128], ks: bf16 [h][max_seq]
+// V: int8 [h][128][max_seq], vs: bf16 [h][max_seq]
+// One bf16 scale per (kv_head, token), max_abs/127, no zero point. The bf16
+// kernels above are untouched; callers pick one set or the other.
+
+void kv_append_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                  MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                  MTL::Buffer* ks, MTL::Buffer* vs, uint32_t pos, uint32_t max_seq,
+                  uint32_t kvh);
+
+void kv_write_b_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                   MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                   MTL::Buffer* ks, MTL::Buffer* vs, uint32_t T, uint32_t start,
+                   uint32_t max_seq);
+
+void attn_decode_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                    MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* ks,
+                    MTL::Buffer* vs, MTL::Buffer* out, uint32_t pos, uint32_t max_seq,
+                    uint32_t kvh, uint32_t window);
+
+void attn_decode_split_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                          MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* ks,
+                          MTL::Buffer* vs, MTL::Buffer* pacc, MTL::Buffer* pm,
+                          MTL::Buffer* pl, uint32_t pos, uint32_t max_seq, uint32_t kvh,
+                          uint32_t splits);
+
+// Prefill attention with K/V dequantised on the fly:
+//   QK: C[M][N] = A[M][K] * B[N][K]^T, B int8 scaled per row (key position).
+//   PV: C[M][N] = A[M][K] * B[N][K]^T, B int8 scaled per column (key position).
+// Byte offsets select the head / slot slice, exactly like gemm_naive.
+void gemm_naive_qk_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
+                      MTL::Buffer* B, MTL::Buffer* bs, MTL::Buffer* C, uint32_t M,
+                      uint32_t N, uint32_t K, uint32_t lda, uint32_t ldb, uint32_t ldc,
+                      uint32_t aoff = 0, uint32_t boff = 0, uint32_t bsoff = 0,
+                      uint32_t coff = 0);
+
+void gemm_naive_pv_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
+                      MTL::Buffer* B, MTL::Buffer* bs, MTL::Buffer* C, uint32_t M,
+                      uint32_t N, uint32_t K, uint32_t lda, uint32_t ldb, uint32_t ldc,
+                      uint32_t aoff = 0, uint32_t boff = 0, uint32_t bsoff = 0,
+                      uint32_t coff = 0);
+
+// Batch (leading slot dimension) int8 writers / decode attention.
+void kv_append_b_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                    MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                    MTL::Buffer* ks, MTL::Buffer* vs, MTL::Buffer* positions,
+                    uint32_t B, uint32_t max_seq, uint32_t kvh);
+
+void attn_decode_b_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                      MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* ks,
+                      MTL::Buffer* vs, MTL::Buffer* out, MTL::Buffer* positions,
+                      uint32_t B, uint32_t max_seq, uint32_t kvh, uint32_t window);
+
+void kv_write_packed_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
+                        MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
+                        MTL::Buffer* ks, MTL::Buffer* vs, MTL::Buffer* slots,
+                        MTL::Buffer* positions, uint32_t T, uint32_t max_seq,
+                        uint32_t kvh);
+
 }  // namespace miori

@@ -775,3 +775,304 @@ kernel void dequant8(device const uint4* q [[buffer(0)]],
             out[base + wi * 4u + j] = bfloat(float((v >> (8u * j)) & 0xFFu) * sc + bi);
     }
 }
+
+// ============================================================ int8 KV cache
+//
+// Optional (MIORI_KV_INT8=1) symmetric int8 KV. Layouts mirror the bf16 ones:
+//   K: [h][pos][d]  int8,  scale ks[h][pos] bf16 = max_abs_over_d / 127
+//   V: [h][d][pos]  int8,  scale vs[h][pos] bf16 = max_abs_over_d / 127
+// The scale is per (kv_head, token); there is no zero point. The quantisers use
+// one threadgroup of 128 threads per (head, token): one value per thread, a
+// threadgroup max reduction, then the store. Readers multiply by the bf16 scale
+// on load; no separate dequantise pass is needed.
+
+static inline float kv_absmax(threadgroup float* sh, float v, uint lane, uint warp) {
+    v = simd_max(v);
+    if (lane == 0u) sh[warp] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    return max(max(sh[0], sh[1]), max(sh[2], sh[3]));
+}
+
+// Append one decode token: one threadgroup per kv head.
+kernel void kv_append_i8(device const bfloat* k [[buffer(0)]],
+                         device const float* v [[buffer(1)]],
+                         device char* kc [[buffer(2)]],
+                         device char* vc [[buffer(3)]],
+                         device bfloat* ks [[buffer(4)]],
+                         device bfloat* vs [[buffer(5)]],
+                         constant uint& pos [[buffer(6)]],
+                         constant uint& max_seq [[buffer(7)]],
+                         uint tg [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint h = tg;
+    const uint d = tid;
+    const float kv = float(k[h * 128u + d]);
+    const float vv = v[h * 128u + d];
+    threadgroup float mk[4], mv[4];
+    const float kmax = kv_absmax(mk, fabs(kv), lane, warp);
+    const float vmax = kv_absmax(mv, fabs(vv), lane, warp);
+    const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
+    const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
+    const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
+    const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
+    kc[((ulong)h * max_seq + pos) * 128u + d] = (char)kq;
+    vc[((ulong)h * 128u + d) * max_seq + pos] = (char)vq;
+    if (tid == 0u) {
+        ks[h * max_seq + pos] = bfloat(kscale);
+        vs[h * max_seq + pos] = bfloat(vscale);
+    }
+}
+
+// Write a prefill chunk [T][512] (one threadgroup per (token, kv head)).
+kernel void kv_write_b_i8(device const bfloat* k [[buffer(0)]],
+                          device const float* v [[buffer(1)]],
+                          device char* kc [[buffer(2)]],
+                          device char* vc [[buffer(3)]],
+                          device bfloat* ks [[buffer(4)]],
+                          device bfloat* vs [[buffer(5)]],
+                          constant uint& start [[buffer(6)]],
+                          constant uint& max_seq [[buffer(7)]],
+                          uint tg [[threadgroup_position_in_grid]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]],
+                          uint warp [[simdgroup_index_in_threadgroup]]) {
+    const uint t = tg / 4u, h = tg % 4u;
+    const uint d = tid;
+    const ulong src = (ulong)t * 512u + h * 128u + d;
+    const uint pos = start + t;
+    const float kv = float(k[(ulong)t * 512u + h * 128u + d]);
+    const float vv = v[src];
+    threadgroup float mk[4], mv[4];
+    const float kmax = kv_absmax(mk, fabs(kv), lane, warp);
+    const float vmax = kv_absmax(mv, fabs(vv), lane, warp);
+    const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
+    const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
+    const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
+    const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
+    kc[((ulong)h * max_seq + pos) * 128u + d] = (char)kq;
+    vc[((ulong)h * 128u + d) * max_seq + pos] = (char)vq;
+    if (tid == 0u) {
+        ks[h * max_seq + pos] = bfloat(kscale);
+        vs[h * max_seq + pos] = bfloat(vscale);
+    }
+}
+
+// ---------------------------------------------------------------- int8 decode attention
+kernel void attn_decode_i8(device const bfloat* q [[buffer(0)]],
+                           device const char* kc [[buffer(1)]],
+                           device const char* vc [[buffer(2)]],
+                           device const bfloat* ks [[buffer(3)]],
+                           device const bfloat* vs [[buffer(4)]],
+                           device float* out [[buffer(5)]],
+                           constant uint& pos [[buffer(6)]],
+                           constant uint& max_seq [[buffer(7)]],
+                           constant uint& kvh [[buffer(8)]],
+                           constant uint& window [[buffer(9)]],
+                           uint tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]]) {
+    const uint h = tg;
+    const uint warp = tid / 32u, lane = tid % 32u;
+    const uint qh = h * 4u + warp;
+    const uint d0 = lane * 4u;
+    float q0 = float(q[qh * 128u + d0 + 0u]);
+    float q1 = float(q[qh * 128u + d0 + 1u]);
+    float q2 = float(q[qh * 128u + d0 + 2u]);
+    float q3 = float(q[qh * 128u + d0 + 3u]);
+    float m = -INFINITY, l = 0.0f, a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    const uint keys = pos + 1u;
+    const uint start = (window && keys > window) ? keys - window : 0u;
+    for (uint t = start; t < keys; ++t) {
+        const ulong kb = ((ulong)h * max_seq + t) * 128u + d0;
+        const float ksc = float(ks[h * max_seq + t]);
+        float s = q0 * float(kc[kb + 0u]) + q1 * float(kc[kb + 1u]) +
+                  q2 * float(kc[kb + 2u]) + q3 * float(kc[kb + 3u]);
+        s = simd_sum(s) * ksc * 0.08838834764831845f;
+        const float nm = max(m, s);
+        const float alpha = exp(m - nm);
+        const float p = exp(s - nm);
+        l = l * alpha + p;
+        const float vsc = float(vs[h * max_seq + t]);
+        const ulong vb = ((ulong)h * 128u + d0) * max_seq + t;
+        a0 = a0 * alpha + p * float(vc[vb + 0ul * max_seq]) * vsc;
+        a1 = a1 * alpha + p * float(vc[vb + 1ul * max_seq]) * vsc;
+        a2 = a2 * alpha + p * float(vc[vb + 2ul * max_seq]) * vsc;
+        a3 = a3 * alpha + p * float(vc[vb + 3ul * max_seq]) * vsc;
+        m = nm;
+    }
+    const float inv = 1.0f / l;
+    out[qh * 128u + d0 + 0u] = a0 * inv;
+    out[qh * 128u + d0 + 1u] = a1 * inv;
+    out[qh * 128u + d0 + 2u] = a2 * inv;
+    out[qh * 128u + d0 + 3u] = a3 * inv;
+}
+
+// ---------------------------------------------------------------- int8 split-K decode attention
+kernel void attn_decode_split_i8(device const bfloat* q [[buffer(0)]],
+                                 device const char* kc [[buffer(1)]],
+                                 device const char* vc [[buffer(2)]],
+                                 device const bfloat* ks [[buffer(3)]],
+                                 device const bfloat* vs [[buffer(4)]],
+                                 device float* pacc [[buffer(5)]],
+                                 device float* pm [[buffer(6)]],
+                                 device float* pl [[buffer(7)]],
+                                 constant uint& pos [[buffer(8)]],
+                                 constant uint& max_seq [[buffer(9)]],
+                                 constant uint& kvh [[buffer(10)]],
+                                 constant uint& splits [[buffer(11)]],
+                                 uint tg [[threadgroup_position_in_grid]],
+                                 uint tid [[thread_index_in_threadgroup]]) {
+    const uint h = tg / splits, sp = tg % splits;
+    const uint warp = tid / 32u, lane = tid % 32u;
+    const uint qh = h * 4u + warp;
+    const uint d0 = lane * 4u;
+    const uint keys = pos + 1u;
+    const uint chunk = (keys + splits - 1u) / splits;
+    const uint a = sp * chunk;
+    const uint b = min(keys, a + chunk);
+    float q0 = float(q[qh * 128u + d0 + 0u]);
+    float q1 = float(q[qh * 128u + d0 + 1u]);
+    float q2 = float(q[qh * 128u + d0 + 2u]);
+    float q3 = float(q[qh * 128u + d0 + 3u]);
+    float m = -INFINITY, l = 0.0f, a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (uint t = a; t < b; ++t) {
+        const ulong kb = ((ulong)h * max_seq + t) * 128u + d0;
+        const float ksc = float(ks[h * max_seq + t]);
+        float s = q0 * float(kc[kb + 0u]) + q1 * float(kc[kb + 1u]) +
+                  q2 * float(kc[kb + 2u]) + q3 * float(kc[kb + 3u]);
+        s = simd_sum(s) * ksc * 0.08838834764831845f;
+        const float nm = max(m, s);
+        const float alpha = exp(m - nm);
+        const float p = exp(s - nm);
+        l = l * alpha + p;
+        const float vsc = float(vs[h * max_seq + t]);
+        const ulong vb = ((ulong)h * 128u + d0) * max_seq + t;
+        a0 = a0 * alpha + p * float(vc[vb + 0ul * max_seq]) * vsc;
+        a1 = a1 * alpha + p * float(vc[vb + 1ul * max_seq]) * vsc;
+        a2 = a2 * alpha + p * float(vc[vb + 2ul * max_seq]) * vsc;
+        a3 = a3 * alpha + p * float(vc[vb + 3ul * max_seq]) * vsc;
+        m = nm;
+    }
+    const uint pi = (h * splits + sp) * 4u + warp;
+    const uint ai = pi * 128u + d0;
+    pm[pi] = m;
+    pl[pi] = l;
+    pacc[ai + 0u] = a0;
+    pacc[ai + 1u] = a1;
+    pacc[ai + 2u] = a2;
+    pacc[ai + 3u] = a3;
+}
+
+// ---------------------------------------------------------------- int8 prefill GEMMs
+// Same tiling as gemm_naive. QK: B is int8 [N][K] with a bf16 scale per row N.
+kernel void gemm_naive_qk_i8(device const bfloat* A [[buffer(0)]],
+                             device const char* B [[buffer(1)]],
+                             device const bfloat* bs [[buffer(2)]],
+                             device float* C [[buffer(3)]],
+                             constant uint& M [[buffer(4)]],
+                             constant uint& N [[buffer(5)]],
+                             constant uint& K [[buffer(6)]],
+                             constant uint& lda [[buffer(7)]],
+                             constant uint& ldb [[buffer(8)]],
+                             constant uint& ldc [[buffer(9)]],
+                             uint2 tgid [[threadgroup_position_in_grid]],
+                             uint2 tid [[thread_position_in_threadgroup]]) {
+    threadgroup float As[64][17];
+    threadgroup float Bs[64][17];
+    const uint tx = tid.x, ty = tid.y;
+    const uint m0 = tgid.y * 64u, n0 = tgid.x * 64u;
+    float acc[4][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
+    for (uint k0 = 0; k0 < K; k0 += 16u) {
+        #pragma unroll
+        for (uint r = 0; r < 4u; ++r) {
+            const uint m = m0 + ty * 4u + r;
+            const uint k = k0 + tx;
+            As[ty * 4u + r][tx] = (m < M && k < K) ? float(A[(ulong)m * lda + k]) : 0.0f;
+            const uint n = n0 + ty * 4u + r;
+            const float scale = (n < N) ? float(bs[n]) : 0.0f;
+            Bs[ty * 4u + r][tx] =
+                (n < N && k < K) ? float(B[(ulong)n * ldb + k]) * scale : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (uint kk = 0; kk < 16u; ++kk) {
+            float a[4], b[4];
+            #pragma unroll
+            for (uint r = 0; r < 4u; ++r) a[r] = As[ty * 4u + r][kk];
+            #pragma unroll
+            for (uint c = 0; c < 4u; ++c) b[c] = Bs[tx * 4u + c][kk];
+            #pragma unroll
+            for (uint r = 0; r < 4u; ++r)
+                #pragma unroll
+                for (uint c = 0; c < 4u; ++c)
+                    acc[r][c] = fma(a[r], b[c], acc[r][c]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    #pragma unroll
+    for (uint r = 0; r < 4u; ++r) {
+        #pragma unroll
+        for (uint c = 0; c < 4u; ++c) {
+            const uint m = m0 + ty * 4u + r;
+            const uint n = n0 + tx * 4u + c;
+            if (m < M && n < N) C[(ulong)m * ldc + n] = acc[r][c];
+        }
+    }
+}
+
+// PV: B is int8 [N][K] with a bf16 scale per column K (per key position).
+kernel void gemm_naive_pv_i8(device const bfloat* A [[buffer(0)]],
+                             device const char* B [[buffer(1)]],
+                             device const bfloat* bs [[buffer(2)]],
+                             device float* C [[buffer(3)]],
+                             constant uint& M [[buffer(4)]],
+                             constant uint& N [[buffer(5)]],
+                             constant uint& K [[buffer(6)]],
+                             constant uint& lda [[buffer(7)]],
+                             constant uint& ldb [[buffer(8)]],
+                             constant uint& ldc [[buffer(9)]],
+                             uint2 tgid [[threadgroup_position_in_grid]],
+                             uint2 tid [[thread_position_in_threadgroup]]) {
+    threadgroup float As[64][17];
+    threadgroup float Bs[64][17];
+    const uint tx = tid.x, ty = tid.y;
+    const uint m0 = tgid.y * 64u, n0 = tgid.x * 64u;
+    float acc[4][4] = {{0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}, {0, 0, 0, 0}};
+    for (uint k0 = 0; k0 < K; k0 += 16u) {
+        #pragma unroll
+        for (uint r = 0; r < 4u; ++r) {
+            const uint m = m0 + ty * 4u + r;
+            const uint k = k0 + tx;
+            As[ty * 4u + r][tx] = (m < M && k < K) ? float(A[(ulong)m * lda + k]) : 0.0f;
+            const uint n = n0 + ty * 4u + r;
+            const float scale = (k < K) ? float(bs[k]) : 0.0f;
+            Bs[ty * 4u + r][tx] =
+                (n < N && k < K) ? float(B[(ulong)n * ldb + k]) * scale : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (uint kk = 0; kk < 16u; ++kk) {
+            float a[4], b[4];
+            #pragma unroll
+            for (uint r = 0; r < 4u; ++r) a[r] = As[ty * 4u + r][kk];
+            #pragma unroll
+            for (uint c = 0; c < 4u; ++c) b[c] = Bs[tx * 4u + c][kk];
+            #pragma unroll
+            for (uint r = 0; r < 4u; ++r)
+                #pragma unroll
+                for (uint c = 0; c < 4u; ++c)
+                    acc[r][c] = fma(a[r], b[c], acc[r][c]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    #pragma unroll
+    for (uint r = 0; r < 4u; ++r) {
+        #pragma unroll
+        for (uint c = 0; c < 4u; ++c) {
+            const uint m = m0 + ty * 4u + r;
+            const uint n = n0 + tx * 4u + c;
+            if (m < M && n < N) C[(ulong)m * ldc + n] = acc[r][c];
+        }
+    }
+}

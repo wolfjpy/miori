@@ -1,0 +1,5 @@
+weights: 732 tensors, 1.59 GB
+tokenizer: vocab=124893 merges=293320 specials=138
+engine: bf16 weight cache 2.93 GB
+engine: buffers ready, KV 92.3 MB (bf16)
+ppl: 24.064 over 1023 tokens (docs/README.md, kv=bf16)

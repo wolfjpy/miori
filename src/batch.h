@@ -102,6 +102,14 @@ public:
     // against the sequential Engine (byte-for-byte KV / conv state compare).
     MTL::Buffer* slot_kv_k(int layer) const { return kc_[layer]; }
     MTL::Buffer* slot_kv_v(int layer) const { return vc_[layer]; }
+    // int8 views (null unless the Engine/BatchEngine run with MIORI_KV_INT8=1).
+    MTL::Buffer* slot_kv_k8(int layer) const { return kc8_[layer]; }
+    MTL::Buffer* slot_kv_v8(int layer) const { return vc8_[layer]; }
+    MTL::Buffer* slot_kv_ks(int layer) const { return ks8_[layer]; }
+    MTL::Buffer* slot_kv_vs(int layer) const { return vs8_[layer]; }
+    bool kv_int8() const { return kv_i8_; }
+    // Live KV bytes for the active format over all kBmax slots.
+    size_t kv_cache_bytes() const;
     MTL::Buffer* slot_conv_state(int layer) const { return cs_[layer]; }
     int conv_state_cur(int layer) const { return cs_cur_[layer]; }
     // Row i of the packed lm_head output (in group order of the last add_batch).
@@ -182,6 +190,11 @@ private:
 
     MTL::Buffer* kc_[kLayers] = {};   // [B][4][4096][128] bf16
     MTL::Buffer* vc_[kLayers] = {};   // [B][4][128][4096] bf16
+    MTL::Buffer* kc8_[kLayers] = {};  // [B][4][4096][128] int8
+    MTL::Buffer* vc8_[kLayers] = {};  // [B][4][128][4096] int8
+    MTL::Buffer* ks8_[kLayers] = {};  // [B][4][4096] bf16 scales
+    MTL::Buffer* vs8_[kLayers] = {};  // [B][4][4096] bf16 scales
+    bool kv_i8_ = false;
     MTL::Buffer* cs_[kLayers] = {};   // [B][2][6][2048] f32
     int cs_cur_[kLayers] = {};
 
