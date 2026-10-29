@@ -43,3 +43,11 @@ prompt=2048 output=64
 prefill: 0.890 s  2302.4 tok/s
 decode:  0.685 s    93.4 tok/s  (113.2 GB/s effective)
 ```
+
+4K context:
+
+```
+prompt=4096 output=32
+prefill: 2.462 s  1663.7 tok/s
+decode:  0.347 s    92.2 tok/s  (111.8 GB/s effective)
+```

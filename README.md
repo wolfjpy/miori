@@ -102,3 +102,5 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 
 Reported on the target M6: prefill 2542 tok/s, decode 94.1 tok/s at 1K context
 (97.5 tok/s at short context), ~114 GB/s effective.
+
+4K context: prefill 1663.7 tok/s, decode 92.2 tok/s.

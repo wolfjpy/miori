@@ -125,7 +125,10 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu) {
     int max_tokens = root.contains("max_tokens") ? (int)root["max_tokens"].as_int() : 256;
     float temp = root.contains("temperature") ? (float)root["temperature"].as_double() : 0.1f;
 
-    auto prompt = tok.chat(system, user, false);
+    bool thinking = false;
+    if (root.contains("chat_template_kwargs") && root["chat_template_kwargs"].contains("enable_thinking"))
+        thinking = root["chat_template_kwargs"]["enable_thinking"].boolean;
+    auto prompt = tok.chat(system, user, thinking);
     GenConfig cfg;
     cfg.max_tokens = max_tokens;
     cfg.temperature = temp;
