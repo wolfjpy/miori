@@ -12,7 +12,7 @@
 | 4-bit decode | 97.5 tok/s (short ctx), 94.1 tok/s (1K ctx, 16-way split-K) | `C1` |
 | OpenAI HTTP + SSE | working, serialized | `C3` |
 | Vision / paged KV / int8 KV | **not implemented** | `C2`, `C4` |
-| Single-prefix KV cache | working (CLI `prefix-test`), not wired to HTTP | `C5` |
+| Single-prefix KV cache | working in CLI and HTTP (one system slot) | `C5` |
 
 ## Milestone verdicts
 

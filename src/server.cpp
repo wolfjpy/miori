@@ -69,10 +69,40 @@ static std::string read_request(int fd, std::string& body) {
     return req.substr(0, hdr);
 }
 
+struct PrefixCache {
+    std::string system;
+    bool valid = false;
+};
+
+static void make_prefix(Tokenizer& t, const std::string& system, std::vector<int>& v) {
+    v.push_back(124894);  // <|startoftext|>
+    if (!system.empty()) {
+        v.push_back(124899);  // <|im_start|>
+        auto a = t.encode("system\n" + system);
+        v.insert(v.end(), a.begin(), a.end());
+        v.push_back(124900);  // <|im_end|>
+        auto nl = t.encode("\n");
+        v.insert(v.end(), nl.begin(), nl.end());
+    }
+}
+
+static void make_suffix(Tokenizer& t, const std::string& user, bool thinking, std::vector<int>& v) {
+    v.push_back(124899);
+    auto b = t.encode("user\n" + user);
+    v.insert(v.end(), b.begin(), b.end());
+    v.push_back(124900);
+    auto nl = t.encode("\n");
+    v.insert(v.end(), nl.begin(), nl.end());
+    v.push_back(124899);
+    auto c = t.encode("assistant\n");
+    v.insert(v.end(), c.begin(), c.end());
+    v.push_back(124901);  // <think>
+    if (!thinking) v.push_back(124902);  // </think>
+}
 static std::atomic<long> g_requests{0};
 static std::atomic<long> g_tokens{0};
 
-static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu) {
+static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu, PrefixCache& pc) {
     std::string body;
     std::string header = read_request(fd, body);
     if (header.empty()) { ::close(fd); return; }
@@ -140,18 +170,30 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu) {
     bool stream = root.contains("stream") && root["stream"].boolean;
     int max_tokens = root.contains("max_tokens") ? (int)root["max_tokens"].as_int() : 256;
     float temp = root.contains("temperature") ? (float)root["temperature"].as_double() : 0.1f;
-
     bool thinking = false;
     if (root.contains("chat_template_kwargs") && root["chat_template_kwargs"].contains("enable_thinking"))
         thinking = root["chat_template_kwargs"]["enable_thinking"].boolean;
-    auto prompt = tok.chat(system, user, thinking);
+
+    std::vector<int> prefix, suffix;
+    make_prefix(tok, system, prefix);
+    make_suffix(tok, user, thinking, suffix);
+
     GenConfig cfg;
     cfg.max_tokens = max_tokens;
     cfg.temperature = temp;
     std::vector<int> out;
     {
         std::lock_guard<std::mutex> lock(mu);
-        out = eng.generate(prompt, cfg);
+        if (!pc.valid || pc.system != system) {
+            eng.reset();
+            eng.prefill_ids(prefix, false);
+            eng.snapshot();
+            pc.system = system;
+            pc.valid = true;
+        } else {
+            eng.restore();
+        }
+        out = eng.generate_from_state(suffix, cfg);
     }
     g_requests.fetch_add(1);
     g_tokens.fetch_add((long)out.size());
@@ -180,9 +222,9 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu) {
                            "\"model\":\"lfm3-vl-2b-mlx-4bit\",\"choices\":[{\"index\":0,"
                            "\"message\":{\"role\":\"assistant\",\"content\":\"" +
                            json_escape(text) + "\"},\"finish_reason\":\"stop\"}],"
-                           "\"usage\":{\"prompt_tokens\":" + std::to_string(prompt.size()) +
+                           "\"usage\":{\"prompt_tokens\":" + std::to_string(prefix.size() + suffix.size()) +
                            ",\"completion_tokens\":" + std::to_string(out.size()) +
-                           ",\"total_tokens\":" + std::to_string(prompt.size() + out.size()) + "}}";
+                           ",\"total_tokens\":" + std::to_string(prefix.size() + suffix.size() + out.size()) + "}}";
         std::string r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
                         std::to_string(resp.size()) + "\r\nConnection: close\r\n\r\n" + resp;
         send_all(fd, r);
@@ -214,13 +256,14 @@ int run_server(Metal& m, Weights& w, int port) {
     if (listen(srv, 128) < 0) { perror("listen"); return 1; }
     printf("miori serving on http://127.0.0.1:%d/v1/chat/completions\n", port);
     std::mutex mu;
+    PrefixCache pc;
     std::atomic<int> live{0};
     for (;;) {
         int fd = ::accept(srv, nullptr, nullptr);
         if (fd < 0) continue;
         live.fetch_add(1);
-        std::thread([fd, &eng, &tok, &mu, &live]() {
-            handle(fd, eng, tok, mu);
+        std::thread([fd, &eng, &tok, &mu, &pc, &live]() {
+            handle(fd, eng, tok, mu, pc);
             live.fetch_sub(1);
         }).detach();
     }
