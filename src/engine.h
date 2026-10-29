@@ -26,6 +26,12 @@ public:
     int sample(const GenConfig& cfg);
     std::vector<int> generate(const std::vector<int>& prompt, const GenConfig& cfg);
     void prefill_chunk(const int* toks, int T, int start, bool need_logits);
+    void prefill_ids(const std::vector<int>& ids, bool need_logits);
+    std::vector<int> decode_loop(const GenConfig& cfg);
+    std::vector<int> generate_from_state(const std::vector<int>& suffix, const GenConfig& cfg);
+    void snapshot();
+    void restore();
+    bool has_snapshot() const { return has_snapshot_; };
     void reset();
     const float* logits() const;
     int pos() const { return pos_; }
@@ -89,6 +95,11 @@ private:
     MTL::Buffer* lm4s_ = nullptr;
     MTL::Buffer* lm4b_ = nullptr;
     bool lm4_ok_ = false;
+    MTL::Buffer* snap_kc_[24] = {};
+    MTL::Buffer* snap_vc_[24] = {};
+    MTL::Buffer* snap_cs_[24] = {};
+    int snap_pos_ = 0;
+    bool has_snapshot_ = false;
     std::unordered_map<std::string, uint32_t> woff_;
     uint32_t wbf_used_ = 0;
     MTL::Buffer* kc_[24] = {};

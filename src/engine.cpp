@@ -76,6 +76,8 @@ bool Engine::init(std::string& err) {
                 const size_t kbytes = (size_t)4096 * 512 * 2;
                 kc_[l] = buf(kbytes);
                 vc_[l] = buf(kbytes);
+                snap_kc_[l] = buf(kbytes);
+                snap_vc_[l] = buf(kbytes);
                 memset(kc_[l]->contents(), 0, kbytes);
                 memset(vc_[l]->contents(), 0, kbytes);
             } else {
@@ -84,6 +86,7 @@ bool Engine::init(std::string& err) {
                     memset(cs_[l][k]->contents(), 0, (size_t)6 * 2048 * 4);
                 }
                 cs_cur_[l] = 0;
+                snap_cs_[l] = buf((size_t)6 * 2048 * 4);
             }
             // validate all tensors used by this layer
             const std::string base = "language_model.model.layers." + std::to_string(l) + ".";
@@ -449,20 +452,56 @@ void Engine::reset() {
     }
 }
 
-std::vector<int> Engine::generate(const std::vector<int>& prompt, const GenConfig& cfg) {
-    reset();
-    std::vector<int> out;
-    auto t0 = std::chrono::steady_clock::now();
+
+void Engine::snapshot() {
+    for (int l = 0; l < 24; ++l) {
+        if (kLayerSuffix[l][0] == 's') {
+            for (int h = 0; h < 4; ++h) {
+                const size_t off = (size_t)h * 4096 * 128 * 2;
+                memcpy((uint8_t*)snap_kc_[l]->contents() + off,
+                       (const uint8_t*)kc_[l]->contents() + off, (size_t)pos_ * 128 * 2);
+                memcpy((uint8_t*)snap_vc_[l]->contents() + off,
+                       (const uint8_t*)vc_[l]->contents() + off, (size_t)pos_ * 128 * 2);
+            }
+        } else {
+            memcpy(snap_cs_[l]->contents(), cs_[l][cs_cur_[l]]->contents(), (size_t)6 * 2048 * 4);
+        }
+    }
+    snap_pos_ = pos_;
+    has_snapshot_ = true;
+}
+
+void Engine::restore() {
+    if (!has_snapshot_) return;
+    for (int l = 0; l < 24; ++l) {
+        if (kLayerSuffix[l][0] == 's') {
+            for (int h = 0; h < 4; ++h) {
+                const size_t off = (size_t)h * 4096 * 128 * 2;
+                memcpy((uint8_t*)kc_[l]->contents() + off,
+                       (const uint8_t*)snap_kc_[l]->contents() + off, (size_t)snap_pos_ * 128 * 2);
+                memcpy((uint8_t*)vc_[l]->contents() + off,
+                       (const uint8_t*)snap_vc_[l]->contents() + off, (size_t)snap_pos_ * 128 * 2);
+            }
+        } else {
+            cs_cur_[l] = 0;
+            memcpy(cs_[l][0]->contents(), snap_cs_[l]->contents(), (size_t)6 * 2048 * 4);
+        }
+    }
+    pos_ = snap_pos_;
+}
+
+void Engine::prefill_ids(const std::vector<int>& ids, bool need_logits) {
     size_t p = 0;
-    if (cfg.slow_prefill) {
-        for (size_t i = 0; i < prompt.size(); ++i) forward(prompt[i], (int)i, i + 1 == prompt.size());
-    } else while (p < prompt.size()) {
-        int n = (int)std::min<size_t>(128, prompt.size() - p);
-        prefill_chunk(prompt.data() + p, n, (int)p, p + n == prompt.size());
+    while (p < ids.size()) {
+        int n = (int)std::min<size_t>(128, ids.size() - p);
+        prefill_chunk(ids.data() + p, n, pos_, need_logits && (p + n == ids.size()));
         p += (size_t)n;
     }
-    auto t1 = std::chrono::steady_clock::now();
-    if (prompt.empty()) return out;
+}
+
+std::vector<int> Engine::decode_loop(const GenConfig& cfg) {
+    std::vector<int> out;
+    if (pos_ == 0) return out;
     int tok = sample(cfg);
     out.push_back(tok);
     for (int t = 1; t < cfg.max_tokens; ++t) {
@@ -471,6 +510,19 @@ std::vector<int> Engine::generate(const std::vector<int>& prompt, const GenConfi
         tok = sample(cfg);
         out.push_back(tok);
     }
+    return out;
+}
+
+std::vector<int> Engine::generate_from_state(const std::vector<int>& suffix, const GenConfig& cfg) {
+    prefill_ids(suffix, true);
+    return decode_loop(cfg);
+}
+std::vector<int> Engine::generate(const std::vector<int>& prompt, const GenConfig& cfg) {
+    reset();
+    auto t0 = std::chrono::steady_clock::now();
+    prefill_ids(prompt, true);
+    auto t1 = std::chrono::steady_clock::now();
+    std::vector<int> out = decode_loop(cfg);
     auto t2 = std::chrono::steady_clock::now();
     double psec = std::chrono::duration<double>(t1 - t0).count();
     double dsec = std::chrono::duration<double>(t2 - t1).count();
@@ -481,7 +533,6 @@ std::vector<int> Engine::generate(const std::vector<int>& prompt, const GenConfi
             out.size() / (dsec + 1e-9));
     return out;
 }
-
 const float* Engine::logits() const { return (const float*)logits_->contents(); }
 
 }  // namespace miori

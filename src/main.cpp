@@ -344,6 +344,51 @@ int main(int argc, char** argv) {
         for (int i = 1; i + 1 < argc; ++i)
             if (std::string(argv[i]) == "--port") port = atoi(argv[i + 1]);
         return run_server(m, w, port);
+    } else if (cmd == "prefix-test") {
+        Tokenizer t;
+        if (!t.load("models/tokenizer.json", err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        Engine e(m, w);
+        if (!e.init(err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        std::string sys;
+        for (int i = 0; i < 40; ++i)
+            sys += "You are a careful assistant. Answer concisely and cite the relevant fact. ";
+        std::vector<int> prefix{124894, 124899};
+        auto a = t.encode("system\n" + sys);
+        prefix.insert(prefix.end(), a.begin(), a.end());
+        prefix.push_back(124900);
+        auto nl = t.encode("\n");
+        prefix.insert(prefix.end(), nl.begin(), nl.end());
+        std::vector<int> suffix{124899};
+        auto b = t.encode("user\nWhat is 2+2?");
+        suffix.insert(suffix.end(), b.begin(), b.end());
+        suffix.push_back(124900);
+        suffix.insert(suffix.end(), nl.begin(), nl.end());
+        suffix.push_back(124899);
+        auto c = t.encode("assistant\n");
+        suffix.insert(suffix.end(), c.begin(), c.end());
+        suffix.push_back(124901);
+        suffix.push_back(124902);
+        std::vector<int> full = prefix;
+        full.insert(full.end(), suffix.begin(), suffix.end());
+        GenConfig cfg;
+        cfg.max_tokens = 8;
+        cfg.temperature = 0.0f;
+        auto t0 = std::chrono::steady_clock::now();
+        auto o1 = e.generate(full, cfg);
+        auto t1 = std::chrono::steady_clock::now();
+        e.reset();
+        e.prefill_ids(prefix, false);
+        e.snapshot();
+        auto t2 = std::chrono::steady_clock::now();
+        e.restore();
+        auto o2 = e.generate_from_state(suffix, cfg);
+        auto t3 = std::chrono::steady_clock::now();
+        double cold = std::chrono::duration<double>(t1 - t0).count();
+        double restore = std::chrono::duration<double>(t2 - t1).count();
+        double warm = std::chrono::duration<double>(t3 - t2).count();
+        printf("prefix=%zu suffix=%zu\n", prefix.size(), suffix.size());
+        printf("cold: %.3f s  cached restore+gen: %.3f s (snapshot %.3f s)\n", cold, warm, restore);
+        printf("cold out: %s\nwarm out: %s\n", t.decode_plain(o1).c_str(), t.decode_plain(o2).c_str());
     } else if (cmd == "ppl") {
         Tokenizer t;
         if (!t.load("models/tokenizer.json", err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
