@@ -100,14 +100,17 @@ public:
 
     // Read-only views used by batch-prefill-test to verify the packed prefill
     // against the sequential Engine (byte-for-byte KV / conv state compare).
-    MTL::Buffer* slot_kv_k(int layer) const { return kc_[layer]; }
-    MTL::Buffer* slot_kv_v(int layer) const { return vc_[layer]; }
-    // int8 views (null unless the Engine/BatchEngine run with MIORI_KV_INT8=1).
-    MTL::Buffer* slot_kv_k8(int layer) const { return kc8_[layer]; }
-    MTL::Buffer* slot_kv_v8(int layer) const { return vc8_[layer]; }
-    MTL::Buffer* slot_kv_ks(int layer) const { return ks8_[layer]; }
-    MTL::Buffer* slot_kv_vs(int layer) const { return vs8_[layer]; }
-    bool kv_int8() const { return kv_i8_; }
+    MTL::Buffer* slot_kv_k(int layer) const { return k_int8() ? nullptr : kc_[layer]; }
+    MTL::Buffer* slot_kv_v(int layer) const { return v_int8() ? nullptr : vc_[layer]; }
+    // Active-format views (the other side's pointers return null).
+    MTL::Buffer* slot_kv_k8(int layer) const { return k_int8() ? kc8_[layer] : nullptr; }
+    MTL::Buffer* slot_kv_v8(int layer) const { return v_int8() ? vc8_[layer] : nullptr; }
+    MTL::Buffer* slot_kv_ks(int layer) const { return k_int8() ? ks8_[layer] : nullptr; }
+    MTL::Buffer* slot_kv_vs(int layer) const { return v_int8() ? vs8_[layer] : nullptr; }
+    bool kv_int8() const { return kv_mode_ == Engine::KvMode::Int8; }
+    bool k_int8() const { return Engine::kv_mode_k_int8(kv_mode_); }
+    bool v_int8() const { return Engine::kv_mode_v_int8(kv_mode_); }
+    Engine::KvMode kv_mode() const { return kv_mode_; }
     // Live KV bytes for the active format over all kBmax slots.
     size_t kv_cache_bytes() const;
     MTL::Buffer* slot_conv_state(int layer) const { return cs_[layer]; }
@@ -194,7 +197,7 @@ private:
     MTL::Buffer* vc8_[kLayers] = {};  // [B][4][128][4096] int8
     MTL::Buffer* ks8_[kLayers] = {};  // [B][4][4096][4] bf16 group scales
     MTL::Buffer* vs8_[kLayers] = {};  // [B][4][4][4096] bf16 group scales
-    bool kv_i8_ = false;
+    Engine::KvMode kv_mode_ = Engine::KvMode::Bf16;
     MTL::Buffer* cs_[kLayers] = {};   // [B][2][6][2048] f32
     int cs_cur_[kLayers] = {};
 
@@ -222,6 +225,10 @@ private:
     MTL::Buffer* embb16_ = nullptr;   // [128000][2048] bf16
     MTL::Buffer* tokb_ = nullptr;     // [64] u32
     MTL::Buffer* posb_ = nullptr;     // [64] u32
+    // Masked inactive-side handles for mixed K/V writers/readers.
+    MTL::Buffer* dummy_bf16_ = nullptr;
+    MTL::Buffer* dummy_i8_ = nullptr;
+    MTL::Buffer* dummy_scale_ = nullptr;
 
     // ---- packed prefill buffers ([kPackRows] rows unless noted) -------------
     MTL::Buffer* pxb_ = nullptr;      // [T][2048] f32 residual

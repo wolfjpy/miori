@@ -308,12 +308,13 @@ kernel void kv_append(device const bfloat* k [[buffer(0)]],
                       constant uint& pos [[buffer(4)]],
                       constant uint& max_seq [[buffer(5)]],
                       constant uint& kvh [[buffer(6)]],
+                      constant uint& mode [[buffer(7)]],
                       uint i [[thread_position_in_grid]]) {
     const uint total = kvh * 128u;
     if (i >= total) return;
     const uint h = i / 128u, d = i % 128u;
-    kc[((ulong)h * max_seq + pos) * 128u + d] = k[h * 128u + d];
-    vc[(h * 128u + d) * max_seq + pos] = bfloat(v[h * 128u + d]);
+    if (mode & 1u) kc[((ulong)h * max_seq + pos) * 128u + d] = k[h * 128u + d];
+    if (mode & 2u) vc[(h * 128u + d) * max_seq + pos] = bfloat(v[h * 128u + d]);
 }
 
 // ---------------------------------------------------------------- RMSNorm (float out)
@@ -486,14 +487,15 @@ kernel void kv_write_b(device const bfloat* k [[buffer(0)]],
                        constant uint& T [[buffer(4)]],
                        constant uint& start [[buffer(5)]],
                        constant uint& max_seq [[buffer(6)]],
+                       constant uint& mode [[buffer(7)]],
                        uint i [[thread_position_in_grid]]) {
     const uint total = T * 4u * 128u;
     if (i >= total) return;
     const uint t = i / 512u, r = i % 512u;
     const uint h = r / 128u, d = r % 128u;
     const uint pos = start + t;
-    kc[((ulong)h * max_seq + pos) * 128u + d] = k[(ulong)t * 512u + r];
-    vc[((ulong)h * 128u + d) * max_seq + pos] = bfloat(v[(ulong)t * 512u + r]);
+    if (mode & 1u) kc[((ulong)h * max_seq + pos) * 128u + d] = k[(ulong)t * 512u + r];
+    if (mode & 2u) vc[((ulong)h * 128u + d) * max_seq + pos] = bfloat(v[(ulong)t * 512u + r]);
 }
 
 // ---------------------------------------------------------------- causal/sliding softmax
@@ -794,6 +796,7 @@ kernel void kv_append_i8(device const bfloat* k [[buffer(0)]],
                          device bfloat* vs [[buffer(5)]],
                          constant uint& pos [[buffer(6)]],
                          constant uint& max_seq [[buffer(7)]],
+                         constant uint& mode [[buffer(8)]],
                          uint tg [[threadgroup_position_in_grid]],
                          uint tid [[thread_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]],
@@ -801,19 +804,21 @@ kernel void kv_append_i8(device const bfloat* k [[buffer(0)]],
     const uint h = tg;
     const uint d = tid;
     const uint g = warp;                      // d / 32
-    const float kv = float(k[h * 128u + d]);
-    const float vv = v[h * 128u + d];
-    const float kmax = simd_max(fabs(kv));
-    const float vmax = simd_max(fabs(vv));
-    const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
-    const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
-    const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
-    const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
-    kc[((ulong)h * max_seq + pos) * 128u + d] = (char)kq;
-    vc[((ulong)h * 128u + d) * max_seq + pos] = (char)vq;
-    if (lane == 0u) {
-        ks[((ulong)h * max_seq + pos) * 4u + g] = bfloat(kscale);
-        vs[((ulong)h * 4u + g) * max_seq + pos] = bfloat(vscale);
+    if (mode & 1u) {
+        const float kv = float(k[h * 128u + d]);
+        const float kmax = simd_max(fabs(kv));
+        const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
+        const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
+        kc[((ulong)h * max_seq + pos) * 128u + d] = (char)kq;
+        if (lane == 0u) ks[((ulong)h * max_seq + pos) * 4u + g] = bfloat(kscale);
+    }
+    if (mode & 2u) {
+        const float vv = v[h * 128u + d];
+        const float vmax = simd_max(fabs(vv));
+        const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
+        const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
+        vc[((ulong)h * 128u + d) * max_seq + pos] = (char)vq;
+        if (lane == 0u) vs[((ulong)h * 4u + g) * max_seq + pos] = bfloat(vscale);
     }
 }
 
@@ -826,6 +831,7 @@ kernel void kv_write_b_i8(device const bfloat* k [[buffer(0)]],
                           device bfloat* vs [[buffer(5)]],
                           constant uint& start [[buffer(6)]],
                           constant uint& max_seq [[buffer(7)]],
+                          constant uint& mode [[buffer(8)]],
                           uint tg [[threadgroup_position_in_grid]],
                           uint tid [[thread_index_in_threadgroup]],
                           uint lane [[thread_index_in_simdgroup]],
@@ -834,20 +840,23 @@ kernel void kv_write_b_i8(device const bfloat* k [[buffer(0)]],
     const uint d = tid;
     const uint g = warp;
     const uint pos = start + t;
-    const ulong src = (ulong)t * 512u + h * 128u + d;
-    const float kv = float(k[src]);
-    const float vv = v[src];
-    const float kmax = simd_max(fabs(kv));
-    const float vmax = simd_max(fabs(vv));
-    const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
-    const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
-    const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
-    const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
-    kc[((ulong)h * max_seq + pos) * 128u + d] = (char)kq;
-    vc[((ulong)h * 128u + d) * max_seq + pos] = (char)vq;
-    if (lane == 0u) {
-        ks[((ulong)h * max_seq + pos) * 4u + g] = bfloat(kscale);
-        vs[((ulong)h * 4u + g) * max_seq + pos] = bfloat(vscale);
+    if (mode & 1u) {
+        const ulong src = (ulong)t * 512u + h * 128u + d;
+        const float kv = float(k[src]);
+        const float kmax = simd_max(fabs(kv));
+        const float kscale = kmax > 0.0f ? kmax / 127.0f : 0.0f;
+        const int kq = kscale > 0.0f ? (int)rint(clamp(kv / kscale, -127.0f, 127.0f)) : 0;
+        kc[((ulong)h * max_seq + pos) * 128u + d] = (char)kq;
+        if (lane == 0u) ks[((ulong)h * max_seq + pos) * 4u + g] = bfloat(kscale);
+    }
+    if (mode & 2u) {
+        const ulong src = (ulong)t * 512u + h * 128u + d;
+        const float vv = v[src];
+        const float vmax = simd_max(fabs(vv));
+        const float vscale = vmax > 0.0f ? vmax / 127.0f : 0.0f;
+        const int vq = vscale > 0.0f ? (int)rint(clamp(vv / vscale, -127.0f, 127.0f)) : 0;
+        vc[((ulong)h * 128u + d) * max_seq + pos] = (char)vq;
+        if (lane == 0u) vs[((ulong)h * 4u + g) * max_seq + pos] = bfloat(vscale);
     }
 }
 
@@ -1080,4 +1089,147 @@ kernel void gemm_naive_pv_i8(device const bfloat* A [[buffer(0)]],
             if (m < M && n < N) C[(ulong)m * ldc + n] = acc[r][c];
         }
     }
+}
+
+// ---------------------------------------------------------------- mixed K/V precision
+// k_int8=1: K is int8 (32-wide group scales) + V is bf16.
+// k_int8=0: K is bf16 + V is int8 (32-wide group scales).
+// The inactive pointers are never dereferenced; callers pass any valid buffer.
+kernel void attn_decode_mix(device const bfloat* q [[buffer(0)]],
+                            device const bfloat* kc_bf [[buffer(1)]],
+                            device const char* kc8 [[buffer(2)]],
+                            device const bfloat* ks [[buffer(3)]],
+                            device const bfloat* vc_bf [[buffer(4)]],
+                            device const char* vc8 [[buffer(5)]],
+                            device const bfloat* vs [[buffer(6)]],
+                            device float* out [[buffer(7)]],
+                            constant uint& pos [[buffer(8)]],
+                            constant uint& max_seq [[buffer(9)]],
+                            constant uint& kvh [[buffer(10)]],
+                            constant uint& window [[buffer(11)]],
+                            constant uint& k_int8 [[buffer(12)]],
+                            uint tg [[threadgroup_position_in_grid]],
+                            uint tid [[thread_index_in_threadgroup]]) {
+    const uint h = tg;
+    const uint warp = tid / 32u, lane = tid % 32u;
+    const uint qh = h * 4u + warp;
+    const uint d0 = lane * 4u;
+    const uint g = lane / 8u;
+    float q0 = float(q[qh * 128u + d0 + 0u]);
+    float q1 = float(q[qh * 128u + d0 + 1u]);
+    float q2 = float(q[qh * 128u + d0 + 2u]);
+    float q3 = float(q[qh * 128u + d0 + 3u]);
+    float m = -INFINITY, l = 0.0f, a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    const uint keys = pos + 1u;
+    const uint start = (window && keys > window) ? keys - window : 0u;
+    for (uint t = start; t < keys; ++t) {
+        const ulong kb = ((ulong)h * max_seq + t) * 128u + d0;
+        float s;
+        if (k_int8) {
+            const float ksc = float(ks[((ulong)h * max_seq + t) * 4u + g]);
+            s = q0 * float(kc8[kb + 0u]) + q1 * float(kc8[kb + 1u]) +
+                q2 * float(kc8[kb + 2u]) + q3 * float(kc8[kb + 3u]);
+            s = simd_sum(s * ksc) * 0.08838834764831845f;
+        } else {
+            s = q0 * float(kc_bf[kb + 0u]) + q1 * float(kc_bf[kb + 1u]) +
+                q2 * float(kc_bf[kb + 2u]) + q3 * float(kc_bf[kb + 3u]);
+            s = simd_sum(s) * 0.08838834764831845f;
+        }
+        const float nm = max(m, s);
+        const float alpha = exp(m - nm);
+        const float p = exp(s - nm);
+        l = l * alpha + p;
+        const ulong vb = ((ulong)h * 128u + d0) * max_seq + t;
+        if (k_int8) {
+            a0 = a0 * alpha + p * float(vc_bf[vb + 0ul * max_seq]);
+            a1 = a1 * alpha + p * float(vc_bf[vb + 1ul * max_seq]);
+            a2 = a2 * alpha + p * float(vc_bf[vb + 2ul * max_seq]);
+            a3 = a3 * alpha + p * float(vc_bf[vb + 3ul * max_seq]);
+        } else {
+            const float vsc = float(vs[((ulong)h * 4u + g) * max_seq + t]);
+            a0 = a0 * alpha + p * float(vc8[vb + 0ul * max_seq]) * vsc;
+            a1 = a1 * alpha + p * float(vc8[vb + 1ul * max_seq]) * vsc;
+            a2 = a2 * alpha + p * float(vc8[vb + 2ul * max_seq]) * vsc;
+            a3 = a3 * alpha + p * float(vc8[vb + 3ul * max_seq]) * vsc;
+        }
+        m = nm;
+    }
+    const float inv = 1.0f / l;
+    out[qh * 128u + d0 + 0u] = a0 * inv;
+    out[qh * 128u + d0 + 1u] = a1 * inv;
+    out[qh * 128u + d0 + 2u] = a2 * inv;
+    out[qh * 128u + d0 + 3u] = a3 * inv;
+}
+
+kernel void attn_decode_split_mix(device const bfloat* q [[buffer(0)]],
+                                  device const bfloat* kc_bf [[buffer(1)]],
+                                  device const char* kc8 [[buffer(2)]],
+                                  device const bfloat* ks [[buffer(3)]],
+                                  device const bfloat* vc_bf [[buffer(4)]],
+                                  device const char* vc8 [[buffer(5)]],
+                                  device const bfloat* vs [[buffer(6)]],
+                                  device float* pacc [[buffer(7)]],
+                                  device float* pm [[buffer(8)]],
+                                  device float* pl [[buffer(9)]],
+                                  constant uint& pos [[buffer(10)]],
+                                  constant uint& max_seq [[buffer(11)]],
+                                  constant uint& kvh [[buffer(12)]],
+                                  constant uint& splits [[buffer(13)]],
+                                  constant uint& k_int8 [[buffer(14)]],
+                                  uint tg [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_index_in_threadgroup]]) {
+    const uint h = tg / splits, sp = tg % splits;
+    const uint warp = tid / 32u, lane = tid % 32u;
+    const uint qh = h * 4u + warp;
+    const uint d0 = lane * 4u;
+    const uint g = lane / 8u;
+    const uint keys = pos + 1u;
+    const uint chunk = (keys + splits - 1u) / splits;
+    const uint a = sp * chunk;
+    const uint b = min(keys, a + chunk);
+    float q0 = float(q[qh * 128u + d0 + 0u]);
+    float q1 = float(q[qh * 128u + d0 + 1u]);
+    float q2 = float(q[qh * 128u + d0 + 2u]);
+    float q3 = float(q[qh * 128u + d0 + 3u]);
+    float m = -INFINITY, l = 0.0f, a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+    for (uint t = a; t < b; ++t) {
+        const ulong kb = ((ulong)h * max_seq + t) * 128u + d0;
+        float s;
+        if (k_int8) {
+            const float ksc = float(ks[((ulong)h * max_seq + t) * 4u + g]);
+            s = q0 * float(kc8[kb + 0u]) + q1 * float(kc8[kb + 1u]) +
+                q2 * float(kc8[kb + 2u]) + q3 * float(kc8[kb + 3u]);
+            s = simd_sum(s * ksc) * 0.08838834764831845f;
+        } else {
+            s = q0 * float(kc_bf[kb + 0u]) + q1 * float(kc_bf[kb + 1u]) +
+                q2 * float(kc_bf[kb + 2u]) + q3 * float(kc_bf[kb + 3u]);
+            s = simd_sum(s) * 0.08838834764831845f;
+        }
+        const float nm = max(m, s);
+        const float alpha = exp(m - nm);
+        const float p = exp(s - nm);
+        l = l * alpha + p;
+        const ulong vb = ((ulong)h * 128u + d0) * max_seq + t;
+        if (k_int8) {
+            a0 = a0 * alpha + p * float(vc_bf[vb + 0ul * max_seq]);
+            a1 = a1 * alpha + p * float(vc_bf[vb + 1ul * max_seq]);
+            a2 = a2 * alpha + p * float(vc_bf[vb + 2ul * max_seq]);
+            a3 = a3 * alpha + p * float(vc_bf[vb + 3ul * max_seq]);
+        } else {
+            const float vsc = float(vs[((ulong)h * 4u + g) * max_seq + t]);
+            a0 = a0 * alpha + p * float(vc8[vb + 0ul * max_seq]) * vsc;
+            a1 = a1 * alpha + p * float(vc8[vb + 1ul * max_seq]) * vsc;
+            a2 = a2 * alpha + p * float(vc8[vb + 2ul * max_seq]) * vsc;
+            a3 = a3 * alpha + p * float(vc8[vb + 3ul * max_seq]) * vsc;
+        }
+        m = nm;
+    }
+    const uint pi = (h * splits + sp) * 4u + warp;
+    const uint ai = pi * 128u + d0;
+    pm[pi] = m;
+    pl[pi] = l;
+    pacc[ai + 0u] = a0;
+    pacc[ai + 1u] = a1;
+    pacc[ai + 2u] = a2;
+    pacc[ai + 3u] = a3;
 }

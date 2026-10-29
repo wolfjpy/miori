@@ -44,9 +44,11 @@ void conv7(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* gated,
            MTL::Buffer* state, MTL::Buffer* state_out, MTL::Buffer* y,
            uint32_t T, uint32_t H);
 
+// mode: 1 = write K only, 2 = write V only, 3 = both (default). Used by the
+// mixed K/V precision modes to reuse the fused writers with one side masked.
 void kv_append(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
                MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
-               uint32_t pos, uint32_t max_seq, uint32_t kvh);
+               uint32_t pos, uint32_t max_seq, uint32_t kvh, uint32_t mode = 3);
 
 void rmsnorm_f32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* x,
                  const Weights& w, const Tensor& gamma, MTL::Buffer* y,
@@ -76,7 +78,7 @@ void gate_mul_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* attn,
 
 void kv_write_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
                 MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
-                uint32_t T, uint32_t start, uint32_t max_seq);
+                uint32_t T, uint32_t start, uint32_t max_seq, uint32_t mode = 3);
 
 void softmax_prefill(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* scores,
                      MTL::Buffer* out, uint32_t T, uint32_t seq, uint32_t start_pos,
@@ -144,7 +146,7 @@ void rope_batch(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
 void kv_append_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
                  MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
                  MTL::Buffer* positions, uint32_t B, uint32_t max_seq,
-                 uint32_t kvh);
+                 uint32_t kvh, uint32_t mode = 3);
 
 // Decode attention for B slots, grid B*kvh, per-slot positions and window.
 void attn_decode_b(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
@@ -184,7 +186,7 @@ void gemv8_b_off(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
 void kv_write_packed(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
                      MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
                      MTL::Buffer* slots, MTL::Buffer* positions, uint32_t T,
-                     uint32_t max_seq, uint32_t kvh);
+                     uint32_t max_seq, uint32_t kvh, uint32_t mode = 3);
 
 // conv7 for one request of a packed batch, with byte offsets into gated [T][H],
 // bcx [T][3H], y [T][H] and state_out [6][H]. `state` is the 6-token window
@@ -218,12 +220,12 @@ void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
 void kv_append_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
                   MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
                   MTL::Buffer* ks, MTL::Buffer* vs, uint32_t pos, uint32_t max_seq,
-                  uint32_t kvh);
+                  uint32_t kvh, uint32_t mode = 3);
 
 void kv_write_b_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
                    MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
                    MTL::Buffer* ks, MTL::Buffer* vs, uint32_t T, uint32_t start,
-                   uint32_t max_seq);
+                   uint32_t max_seq, uint32_t mode = 3);
 
 void attn_decode_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
                     MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* ks,
@@ -256,7 +258,7 @@ void gemm_naive_pv_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
 void kv_append_b_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
                     MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
                     MTL::Buffer* ks, MTL::Buffer* vs, MTL::Buffer* positions,
-                    uint32_t B, uint32_t max_seq, uint32_t kvh);
+                    uint32_t B, uint32_t max_seq, uint32_t kvh, uint32_t mode = 3);
 
 void attn_decode_b_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
                       MTL::Buffer* kc, MTL::Buffer* vc, MTL::Buffer* ks,
@@ -267,6 +269,31 @@ void kv_write_packed_i8(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* k,
                         MTL::Buffer* v, MTL::Buffer* kc, MTL::Buffer* vc,
                         MTL::Buffer* ks, MTL::Buffer* vs, MTL::Buffer* slots,
                         MTL::Buffer* positions, uint32_t T, uint32_t max_seq,
-                        uint32_t kvh);
+                        uint32_t kvh, uint32_t mode = 3);
+
+// ---- mixed K/V precision ---------------------------------------------------
+// k_int8 selects K int8 + V bf16 (true) or K bf16 + V int8 (false). The int8
+// side uses the 32-wide group scales; the bf16 side is the normal cache. The
+// pointer for the inactive side is ignored (pass any valid buffer).
+void attn_decode_mix(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                     MTL::Buffer* kc_bf, MTL::Buffer* kc8, MTL::Buffer* ks,
+                     MTL::Buffer* vc_bf, MTL::Buffer* vc8, MTL::Buffer* vs,
+                     MTL::Buffer* out, uint32_t pos, uint32_t max_seq, uint32_t kvh,
+                     uint32_t window, uint32_t k_int8);
+
+void attn_decode_split_mix(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                           MTL::Buffer* kc_bf, MTL::Buffer* kc8, MTL::Buffer* ks,
+                           MTL::Buffer* vc_bf, MTL::Buffer* vc8, MTL::Buffer* vs,
+                           MTL::Buffer* pacc, MTL::Buffer* pm, MTL::Buffer* pl,
+                           uint32_t pos, uint32_t max_seq, uint32_t kvh,
+                           uint32_t splits, uint32_t k_int8);
+
+void attn_decode_b_mix(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* q,
+                       MTL::Buffer* kc_bf, MTL::Buffer* kc8, MTL::Buffer* ks,
+                       MTL::Buffer* vc_bf, MTL::Buffer* vc8, MTL::Buffer* vs,
+                       MTL::Buffer* out, MTL::Buffer* positions, uint32_t B,
+                       uint32_t max_seq, uint32_t kvh, uint32_t window,
+                       uint32_t k_int8);
+
 
 }  // namespace miori

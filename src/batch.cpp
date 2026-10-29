@@ -51,6 +51,9 @@ bool BatchEngine::init(std::string& err) {
         embb_ = buf((size_t)kRows * kHidden * 2);
         tokb_ = buf(64 * 4);
         posb_ = buf(64 * 4);
+        dummy_bf16_ = buf(4096);
+        dummy_i8_ = buf(4096);
+        dummy_scale_ = buf(4096);
 
         // ---- packed prefill activations ([kPackRows] rows)
         pxb_ = buf((size_t)kPackRows * kHidden * 4);
@@ -86,22 +89,25 @@ bool BatchEngine::init(std::string& err) {
         const size_t slot_kv8 = (size_t)kKvHeads * kMaxSeq * kHeadDim;     // 2 MB
         // K scales [h][pos][4], V scales [h][4][pos]: 4 bf16 per (head, token)
         const size_t slot_scale = (size_t)kKvHeads * kMaxSeq * 4;          // bf16 each
-        kv_i8_ = eng_.kv_int8();
+        kv_mode_ = eng_.kv_mode();
         for (int l = 0; l < kLayers; ++l) {
             if (Engine::is_attention_layer(l)) {
-                if (kv_i8_) {
+                if (k_int8()) {
                     kc8_[l] = buf(slot_kv8 * kBmax);
-                    vc8_[l] = buf(slot_kv8 * kBmax);
                     ks8_[l] = buf(slot_scale * kBmax * 2);
-                    vs8_[l] = buf(slot_scale * kBmax * 2);
                     memset(kc8_[l]->contents(), 0, slot_kv8 * kBmax);
-                    memset(vc8_[l]->contents(), 0, slot_kv8 * kBmax);
                     memset(ks8_[l]->contents(), 0, slot_scale * kBmax * 2);
-                    memset(vs8_[l]->contents(), 0, slot_scale * kBmax * 2);
                 } else {
                     kc_[l] = buf(slot_kv * kBmax);
-                    vc_[l] = buf(slot_kv * kBmax);
                     memset(kc_[l]->contents(), 0, slot_kv * kBmax);
+                }
+                if (v_int8()) {
+                    vc8_[l] = buf(slot_kv8 * kBmax);
+                    vs8_[l] = buf(slot_scale * kBmax * 2);
+                    memset(vc8_[l]->contents(), 0, slot_kv8 * kBmax);
+                    memset(vs8_[l]->contents(), 0, slot_scale * kBmax * 2);
+                } else {
+                    vc_[l] = buf(slot_kv * kBmax);
                     memset(vc_[l]->contents(), 0, slot_kv * kBmax);
                 }
             } else {
@@ -141,7 +147,7 @@ bool BatchEngine::init(std::string& err) {
                                ppslot_, pprow_})
             pack_bytes += (size_t)b->length();
         printf("batch: Bmax=%d, slot KV %.1f MB total (%s), conv state %.1f MB, logits %.1f MB\n",
-               kBmax, kv_bytes / 1e6, kv_i8_ ? "int8" : "bf16", cs_bytes / 1e6,
+               kBmax, kv_bytes / 1e6, Engine::kv_mode_name(kv_mode_), cs_bytes / 1e6,
                (double)kBmax * kVocab * 4 / 1e6);
         printf("batch: packed prefill rows=%d (%.1f MB activations), chunk=%d\n", kPackRows,
                pack_bytes / 1e6, kPackChunk);
@@ -157,12 +163,10 @@ size_t BatchEngine::kv_cache_bytes() const {
     size_t n = 0;
     for (int l = 0; l < kLayers; ++l) {
         if (!Engine::is_attention_layer(l)) continue;
-        if (kv_i8_ && kc8_[l]) {
-            n += kc8_[l]->length() + vc8_[l]->length() + ks8_[l]->length() +
-                 vs8_[l]->length();
-        } else if (kc_[l]) {
-            n += kc_[l]->length() + vc_[l]->length();
-        }
+        if (k_int8() && kc8_[l]) n += kc8_[l]->length() + ks8_[l]->length();
+        else if (kc_[l]) n += kc_[l]->length();
+        if (v_int8() && vc8_[l]) n += vc8_[l]->length() + vs8_[l]->length();
+        else if (vc_[l]) n += vc_[l]->length();
     }
     return n;
 }
@@ -258,16 +262,33 @@ void BatchEngine::attn_layer(int layer) {
     const bool partial = (kind == 1);
     const float theta = partial ? 1000000.0f : 10000.0f;
     rope_batch(m_, e_, qnb_, knb_, posb_, B, theta, partial);
-    if (kv_i8_) {
+    const Engine::KvMode mode = kv_mode_;
+    if (mode == Engine::KvMode::Int8) {
         kv_append_b_i8(m_, e_, knb_, vb_, kc8_[layer], vc8_[layer], ks8_[layer],
                        vs8_[layer], posb_, B, kMaxSeq, kKvHeads);
         attn_decode_b_i8(m_, e_, qnb_, kc8_[layer], vc8_[layer], ks8_[layer],
                          vs8_[layer], ab_, posb_, B, kMaxSeq, kKvHeads,
                          kind == 2 ? 256u : 0u);
-    } else {
+    } else if (mode == Engine::KvMode::Bf16) {
         kv_append_b(m_, e_, knb_, vb_, kc_[layer], vc_[layer], posb_, B, kMaxSeq, kKvHeads);
         attn_decode_b(m_, e_, qnb_, kc_[layer], vc_[layer], ab_, posb_, B, kMaxSeq, kKvHeads,
                       kind == 2 ? 256u : 0u);
+    } else if (k_int8()) {   // K int8 + V bf16
+        kv_append_b_i8(m_, e_, knb_, vb_, kc8_[layer], dummy_i8_, ks8_[layer],
+                       dummy_scale_, posb_, B, kMaxSeq, kKvHeads, 1);
+        kv_append_b(m_, e_, knb_, vb_, dummy_bf16_, vc_[layer], posb_, B, kMaxSeq,
+                    kKvHeads, 2);
+        attn_decode_b_mix(m_, e_, qnb_, dummy_bf16_, kc8_[layer], ks8_[layer], vc_[layer],
+                          dummy_i8_, dummy_scale_, ab_, posb_, B, kMaxSeq, kKvHeads,
+                          kind == 2 ? 256u : 0u, 1);
+    } else {                 // K bf16 + V int8
+        kv_append_b(m_, e_, knb_, vb_, kc_[layer], dummy_bf16_, posb_, B, kMaxSeq,
+                    kKvHeads, 1);
+        kv_append_b_i8(m_, e_, knb_, vb_, dummy_i8_, vc8_[layer], dummy_scale_,
+                       vs8_[layer], posb_, B, kMaxSeq, kKvHeads, 2);
+        attn_decode_b_mix(m_, e_, qnb_, kc_[layer], dummy_i8_, dummy_scale_, dummy_bf16_,
+                          vc8_[layer], vs8_[layer], ab_, posb_, B, kMaxSeq, kKvHeads,
+                          kind == 2 ? 256u : 0u, 0);
     }
     gate_mul_b(m_, e_, ab_, gb_, agb_, B * kHidden);
     linear(agb_, pb_, lw_[layer].o);
@@ -290,7 +311,7 @@ void BatchEngine::conv_layer(int layer) {
 
 int BatchEngine::add_sequence(const std::vector<int>& prompt, int max_new_tokens) {
     // The KV format is captured at init(); the copy below assumes Engine matches.
-    if (!ready_ || prompt.empty() || eng_.kv_int8() != kv_i8_) return -1;
+    if (!ready_ || prompt.empty() || eng_.kv_mode() != kv_mode_) return -1;
     int slot = -1;
     for (int s = 0; s < kBmax; ++s) {
         if (!slots_[s].active) { slot = s; break; }
@@ -312,59 +333,56 @@ int BatchEngine::add_sequence(const std::vector<int>& prompt, int max_new_tokens
         return -1;
     }
 
-    // 2. Copy the used KV positions per head into the slot's cache (raw bytes in
-    // the active format; int8 also copies the per-token scales).
-    if (kv_i8_) {
-        const size_t kb = (size_t)pos * kHeadDim;   // int8 bytes used per head
-        const size_t vb = (size_t)pos;              // int8 bytes used per V row
-        const size_t sb = (size_t)pos * 2;          // scale bytes per head
-        for (int l = 0; l < kLayers; ++l) {
-            if (!Engine::is_attention_layer(l)) continue;
-            const uint8_t* sk = (const uint8_t*)eng_.kv_k8(l)->contents();
-            const uint8_t* sv = (const uint8_t*)eng_.kv_v8(l)->contents();
-            const uint8_t* ss = (const uint8_t*)eng_.kv_ks(l)->contents();
-            const uint8_t* svs = (const uint8_t*)eng_.kv_vs(l)->contents();
-            uint8_t* dk = (uint8_t*)kc8_[l]->contents();
-            uint8_t* dv = (uint8_t*)vc8_[l]->contents();
-            uint8_t* ds = (uint8_t*)ks8_[l]->contents();
-            uint8_t* dvs = (uint8_t*)vs8_[l]->contents();
-            const size_t skb = (size_t)pos * 4 * 2;   // K scales [pos][4]
-            for (int h = 0; h < kKvHeads; ++h) {
-                const size_t head = (size_t)slot * kKvHeads + h;
-                const size_t src_h = (size_t)h * kMaxSeq * kHeadDim;
-                const size_t dst_h = head * kMaxSeq * kHeadDim;
-                if (kb) memcpy(dk + dst_h, sk + src_h, kb);
-                const size_t src_ks = (size_t)h * kMaxSeq * 4 * 2;
-                const size_t dst_ks = head * kMaxSeq * 4 * 2;
-                if (skb) memcpy(ds + dst_ks, ss + src_ks, skb);
-                for (int g = 0; g < 4; ++g) {
-                    const size_t src_vs = ((size_t)h * 4 + g) * kMaxSeq * 2;
-                    const size_t dst_vs = (head * 4 + g) * kMaxSeq * 2;
-                    if (sb) memcpy(dvs + dst_vs, svs + src_vs, sb);
-                }
-                for (int d = 0; d < kHeadDim; ++d) {
-                    const size_t src_r = ((size_t)h * kHeadDim + d) * kMaxSeq;
-                    const size_t dst_r = (head * kHeadDim + d) * kMaxSeq;
-                    if (vb) memcpy(dv + dst_r, sv + src_r, vb);
-                }
+    // 2. Copy the used KV positions into the slot's cache, per side and in the
+    // active format (int8 sides also copy their group scales).
+    for (int l = 0; l < kLayers; ++l) {
+        if (!Engine::is_attention_layer(l)) continue;
+        for (int h = 0; h < kKvHeads; ++h) {
+            const size_t head = (size_t)slot * kKvHeads + h;
+            if (k_int8()) {
+                const size_t kb = (size_t)pos * kHeadDim;
+                const size_t skb = (size_t)pos * 4 * 2;
+                const uint8_t* sk = (const uint8_t*)eng_.kv_k8(l)->contents() +
+                                    (size_t)h * kMaxSeq * kHeadDim;
+                const uint8_t* ss = (const uint8_t*)eng_.kv_ks(l)->contents() +
+                                    (size_t)h * kMaxSeq * 4 * 2;
+                uint8_t* dk = (uint8_t*)kc8_[l]->contents() + head * kMaxSeq * kHeadDim;
+                uint8_t* ds = (uint8_t*)ks8_[l]->contents() + head * kMaxSeq * 4 * 2;
+                if (kb) memcpy(dk, sk, kb);
+                if (skb) memcpy(ds, ss, skb);
+            } else {
+                const size_t kb = (size_t)pos * kHeadDim * 2;
+                const uint8_t* sk = (const uint8_t*)eng_.kv_k(l)->contents() +
+                                    (size_t)h * kMaxSeq * kHeadDim * 2;
+                uint8_t* dk = (uint8_t*)kc_[l]->contents() +
+                              head * kMaxSeq * kHeadDim * 2;
+                if (kb) memcpy(dk, sk, kb);
             }
-        }
-    } else {
-        const size_t kb = (size_t)pos * kHeadDim * 2;   // bytes used per head
-        const size_t vs = (size_t)pos * 2;              // bytes used per V row
-        for (int l = 0; l < kLayers; ++l) {
-            if (!Engine::is_attention_layer(l)) continue;
-            const uint8_t* sk = (const uint8_t*)eng_.kv_k(l)->contents();
-            const uint8_t* sv = (const uint8_t*)eng_.kv_v(l)->contents();
-            uint8_t* dk = (uint8_t*)kc_[l]->contents();
-            uint8_t* dv = (uint8_t*)vc_[l]->contents();
-            const size_t slot_off = (size_t)slot * kKvHeads * kMaxSeq * kHeadDim * 2;
-            for (int h = 0; h < kKvHeads; ++h) {
-                const size_t head_off = (size_t)h * kMaxSeq * kHeadDim * 2;
-                if (kb) memcpy(dk + slot_off + head_off, sk + head_off, kb);
+            if (v_int8()) {
+                const size_t vb = (size_t)pos;
+                const size_t sb = (size_t)pos * 2;
+                const uint8_t* sv = (const uint8_t*)eng_.kv_v8(l)->contents();
+                const uint8_t* svs = (const uint8_t*)eng_.kv_vs(l)->contents();
+                uint8_t* dv = (uint8_t*)vc8_[l]->contents();
+                uint8_t* dvs = (uint8_t*)vs8_[l]->contents();
                 for (int d = 0; d < kHeadDim; ++d) {
-                    const size_t row_off = ((size_t)h * kHeadDim + d) * kMaxSeq * 2;
-                    if (vs) memcpy(dv + slot_off + row_off, sv + row_off, vs);
+                    const size_t src = ((size_t)h * kHeadDim + d) * kMaxSeq;
+                    const size_t dst = (head * kHeadDim + d) * kMaxSeq;
+                    if (vb) memcpy(dv + dst, sv + src, vb);
+                }
+                for (int g = 0; g < 4; ++g) {
+                    const size_t src = ((size_t)h * 4 + g) * kMaxSeq * 2;
+                    const size_t dst = (head * 4 + g) * kMaxSeq * 2;
+                    if (sb) memcpy(dvs + dst, svs + src, sb);
+                }
+            } else {
+                const size_t vb = (size_t)pos * 2;
+                const uint8_t* sv = (const uint8_t*)eng_.kv_v(l)->contents();
+                uint8_t* dv = (uint8_t*)vc_[l]->contents();
+                for (int d = 0; d < kHeadDim; ++d) {
+                    const size_t src = ((size_t)h * kHeadDim + d) * kMaxSeq * 2;
+                    const size_t dst = (head * kHeadDim + d) * kMaxSeq * 2;
+                    if (vb) memcpy(dv + dst, sv + src, vb);
                 }
             }
         }
@@ -442,12 +460,23 @@ void BatchEngine::packed_attn(int layer, const std::vector<std::vector<int>>& pr
     const bool partial = (kind == 1);
     const float theta = partial ? 1000000.0f : 10000.0f;
     rope_batch(m_, e_, pqnb_, pknb_, pppos_, Tu, theta, partial);
-    if (kv_i8_) {
+    const Engine::KvMode mode = kv_mode_;
+    if (mode == Engine::KvMode::Int8) {
         kv_write_packed_i8(m_, e_, pknb_, pvb_, kc8_[layer], vc8_[layer], ks8_[layer],
                            vs8_[layer], ppslot_, pppos_, Tu, kMaxSeq, kKvHeads);
-    } else {
+    } else if (mode == Engine::KvMode::Bf16) {
         kv_write_packed(m_, e_, pknb_, pvb_, kc_[layer], vc_[layer], ppslot_, pppos_, Tu,
                         kMaxSeq, kKvHeads);
+    } else if (k_int8()) {   // K int8 + V bf16
+        kv_write_packed_i8(m_, e_, pknb_, pvb_, kc8_[layer], dummy_i8_, ks8_[layer],
+                           dummy_scale_, ppslot_, pppos_, Tu, kMaxSeq, kKvHeads, 1);
+        kv_write_packed(m_, e_, pknb_, pvb_, dummy_bf16_, vc_[layer], ppslot_, pppos_, Tu,
+                        kMaxSeq, kKvHeads, 2);
+    } else {                 // K bf16 + V int8
+        kv_write_packed(m_, e_, pknb_, pvb_, kc_[layer], dummy_bf16_, ppslot_, pppos_, Tu,
+                        kMaxSeq, kKvHeads, 1);
+        kv_write_packed_i8(m_, e_, pknb_, pvb_, dummy_i8_, vc8_[layer], dummy_scale_,
+                           vs8_[layer], ppslot_, pppos_, Tu, kMaxSeq, kKvHeads, 2);
     }
 
     // Per-request attention on its own token range and slot KV. The chunking
@@ -462,32 +491,28 @@ void BatchEngine::packed_attn(int layer, const std::vector<std::vector<int>>& pr
             const uint32_t row0 = (uint32_t)(row + c);
             for (uint32_t h = 0; h < 16; ++h) {
                 const uint32_t kvh = h / 4u;
-                if (kv_i8_) {
-                    const uint32_t hbase =
-                        (uint32_t)(slot * kKvHeads + kvh) * kMaxSeq * kHeadDim;  // bytes
-                    // K scales [pos][4], V scales [4][pos]: both are
-                    // max_seq * 4 * 2 bytes per head.
-                    const uint32_t sbase =
-                        (uint32_t)(slot * kKvHeads + kvh) * kMaxSeq * 4u * 2u;
+                const uint32_t head = (uint32_t)(slot * kKvHeads + kvh);
+                const uint32_t hbase = head * kMaxSeq * kHeadDim;         // int8 bytes
+                const uint32_t sbase = head * kMaxSeq * 4u * 2u;          // scale bytes
+                const uint32_t kbase = head * kMaxSeq * kHeadDim * 2u;    // bf16 bytes
+                const uint32_t vbase = head * kHeadDim * kMaxSeq * 2u;
+                if (k_int8()) {
                     gemm_naive_qk_i8(m_, e_, pqnb_, kc8_[layer], ks8_[layer], pscores_,
                                      (uint32_t)clen, seq, 128, kHidden, kHeadDim, seq,
                                      (row0 * kHidden + h * kHeadDim) * 2u, hbase, sbase, 0);
-                    softmax_prefill(m_, e_, pscores_, pscores_bf_, (uint32_t)clen, seq,
-                                    (uint32_t)c, kind == 2);
-                    gemm_naive_pv_i8(m_, e_, pscores_bf_, vc8_[layer], vs8_[layer], pab_,
-                                     (uint32_t)clen, 128, seq, seq, kMaxSeq, kHidden, 0,
-                                     hbase, sbase, (row0 * kHidden + h * kHeadDim) * 4u);
                 } else {
-                    const uint32_t kbase =
-                        ((slot * kKvHeads + kvh) * kMaxSeq * kHeadDim) * 2u;
-                    const uint32_t vbase =
-                        ((slot * kKvHeads + kvh) * kHeadDim * kMaxSeq) * 2u;
                     // scores = q_chunk . K[0..seq)
                     gemm_naive(m_, e_, pqnb_, kc_[layer], pscores_, (uint32_t)clen, seq, 128,
                                kHidden, kHeadDim, seq, (row0 * kHidden + h * kHeadDim) * 2u,
                                kbase, 0);
-                    softmax_prefill(m_, e_, pscores_, pscores_bf_, (uint32_t)clen, seq,
-                                    (uint32_t)c, kind == 2);
+                }
+                softmax_prefill(m_, e_, pscores_, pscores_bf_, (uint32_t)clen, seq,
+                                (uint32_t)c, kind == 2);
+                if (v_int8()) {
+                    gemm_naive_pv_i8(m_, e_, pscores_bf_, vc8_[layer], vs8_[layer], pab_,
+                                     (uint32_t)clen, 128, seq, seq, kMaxSeq, kHidden, 0,
+                                     hbase, sbase, (row0 * kHidden + h * kHeadDim) * 4u);
+                } else {
                     // out_chunk = P . V[0..seq)
                     gemm_naive(m_, e_, pscores_bf_, vc_[layer], pab_, (uint32_t)clen, 128,
                                seq, seq, kMaxSeq, kHidden, 0, vbase,

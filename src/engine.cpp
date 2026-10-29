@@ -110,18 +110,25 @@ bool Engine::init(std::string& err) {
                 w_.get(base + p + ".biases");
             }
         }
-        // KV format: bf16 by default; MIORI_KV_INT8=1 selects the optional int8
-        // cache (one bf16 scale per kv_head/token). Only the chosen format is
-        // allocated, so the flag also cuts the live KV footprint in half.
-        {
-            const char* e = getenv("MIORI_KV_INT8");
-            kv_i8_ = e && atoi(e) != 0;
+        // KV format: bf16 by default; MIORI_KV_INT8=1 selects full int8 and
+        // MIORI_KV_MIX=kv|vk selects a mixed K/V cache (the letter is the
+        // quantised side). Only the chosen side formats are allocated.
+        KvMode want = KvMode::Bf16;
+        if (const char* mix = getenv("MIORI_KV_MIX")) {
+            if (std::strcmp(mix, "kv") == 0) want = KvMode::K8V16;
+            else if (std::strcmp(mix, "vk") == 0) want = KvMode::K16V8;
+            else {
+                err = std::string("MIORI_KV_MIX must be kv or vk, got '") + mix + "'";
+                return false;
+            }
+        } else if (const char* e = getenv("MIORI_KV_INT8"); e && atoi(e) != 0) {
+            want = KvMode::Int8;
         }
-        if (kv_i8_) {
-            if (!alloc_int8_kv(err)) return false;
-        } else {
-            if (!alloc_bf16_kv(err)) return false;
-        }
+        kv_mode_ = want;
+        if (!alloc_kv_for_mode(want, err)) return false;
+        dummy_bf16_ = buf(4096);
+        dummy_i8_ = buf(4096);
+        dummy_scale_ = buf(4096);
         w_.get("language_model.model.embedding_norm.weight");
         w_.get("language_model.model.embed_tokens.weight");
         w_.get("language_model.model.embed_tokens.scales");
@@ -170,7 +177,7 @@ bool Engine::init(std::string& err) {
         m_.submit(cb_, true);
         printf("engine: bf16 weight cache %.2f GB\n", wbf_used_ / 1e9);
         printf("engine: buffers ready, KV %.1f MB (%s)\n", kv_cache_bytes() / 1e6,
-               kv_i8_ ? "int8 + per-head/token bf16 scales" : "bf16");
+               kv_mode_name(kv_mode_));
     } catch (const std::exception& e) {
         err = e.what();
         return false;
@@ -179,33 +186,44 @@ bool Engine::init(std::string& err) {
 }
 
 // ---- KV allocation ---------------------------------------------------------
-// Both helpers are idempotent so set_kv_int8() can allocate the other format
-// lazily without disturbing the live one.
+// One allocator per side/format, idempotent so set_kv_mode() can add the
+// buffers a mixed mode needs without disturbing the ones already live.
 
-bool Engine::alloc_bf16_kv(std::string& err) {
+bool Engine::alloc_k_bf16(std::string& err) {
     try {
         const size_t kbytes = (size_t)kMaxSeq * kKvHeads * kHeadDim * 2;
         for (int l = 0; l < 24; ++l) {
             if (!is_attention_layer(l) || kc_[l]) continue;
             kc_[l] = m_.new_buffer(kbytes);
-            vc_[l] = m_.new_buffer(kbytes);
             memset(kc_[l]->contents(), 0, kbytes);
-            memset(vc_[l]->contents(), 0, kbytes);
-            for (int s = 0; s < kSnapshotSlots; ++s) {
-                if (!snap_kc_[s][l]) {
-                    snap_kc_[s][l] = m_.new_buffer(kbytes);
-                    snap_vc_[s][l] = m_.new_buffer(kbytes);
-                }
-            }
+            for (int s = 0; s < kSnapshotSlots; ++s)
+                if (!snap_kc_[s][l]) snap_kc_[s][l] = m_.new_buffer(kbytes);
         }
     } catch (const std::exception& e) {
-        err = std::string("kv bf16 alloc: ") + e.what();
+        err = std::string("kv bf16 K alloc: ") + e.what();
         return false;
     }
     return true;
 }
 
-bool Engine::alloc_int8_kv(std::string& err) {
+bool Engine::alloc_v_bf16(std::string& err) {
+    try {
+        const size_t kbytes = (size_t)kMaxSeq * kKvHeads * kHeadDim * 2;
+        for (int l = 0; l < 24; ++l) {
+            if (!is_attention_layer(l) || vc_[l]) continue;
+            vc_[l] = m_.new_buffer(kbytes);
+            memset(vc_[l]->contents(), 0, kbytes);
+            for (int s = 0; s < kSnapshotSlots; ++s)
+                if (!snap_vc_[s][l]) snap_vc_[s][l] = m_.new_buffer(kbytes);
+        }
+    } catch (const std::exception& e) {
+        err = std::string("kv bf16 V alloc: ") + e.what();
+        return false;
+    }
+    return true;
+}
+
+bool Engine::alloc_k_int8(std::string& err) {
     try {
         const size_t k8 = (size_t)kKvHeads * kMaxSeq * kHeadDim;   // 2 MiB / layer
         // one bf16 scale per (head, token, 32-wide d group): [4][4096][4]
@@ -213,69 +231,116 @@ bool Engine::alloc_int8_kv(std::string& err) {
         for (int l = 0; l < 24; ++l) {
             if (!is_attention_layer(l) || kc8_[l]) continue;
             kc8_[l] = m_.new_buffer(k8);
-            vc8_[l] = m_.new_buffer(k8);
             ks8_[l] = m_.new_buffer(s8);
-            vs8_[l] = m_.new_buffer(s8);
             memset(kc8_[l]->contents(), 0, k8);
-            memset(vc8_[l]->contents(), 0, k8);
             memset(ks8_[l]->contents(), 0, s8);
-            memset(vs8_[l]->contents(), 0, s8);
             for (int s = 0; s < kSnapshotSlots; ++s) {
                 if (!snap_kc8_[s][l]) {
                     snap_kc8_[s][l] = m_.new_buffer(k8);
-                    snap_vc8_[s][l] = m_.new_buffer(k8);
                     snap_ks8_[s][l] = m_.new_buffer(s8);
-                    snap_vs8_[s][l] = m_.new_buffer(s8);
                 }
             }
         }
     } catch (const std::exception& e) {
-        err = std::string("kv int8 alloc: ") + e.what();
+        err = std::string("kv int8 K alloc: ") + e.what();
         return false;
     }
     return true;
 }
 
-bool Engine::set_kv_int8(bool on, std::string& err) {
-    if (on == kv_i8_) return true;
-    if (on) {
-        if (!alloc_int8_kv(err)) return false;
-    } else {
-        if (!alloc_bf16_kv(err)) return false;
+bool Engine::alloc_v_int8(std::string& err) {
+    try {
+        const size_t v8 = (size_t)kKvHeads * kMaxSeq * kHeadDim;
+        const size_t s8 = (size_t)kKvHeads * kMaxSeq * 4 * 2;
+        for (int l = 0; l < 24; ++l) {
+            if (!is_attention_layer(l) || vc8_[l]) continue;
+            vc8_[l] = m_.new_buffer(v8);
+            vs8_[l] = m_.new_buffer(s8);
+            memset(vc8_[l]->contents(), 0, v8);
+            memset(vs8_[l]->contents(), 0, s8);
+            for (int s = 0; s < kSnapshotSlots; ++s) {
+                if (!snap_vc8_[s][l]) {
+                    snap_vc8_[s][l] = m_.new_buffer(v8);
+                    snap_vs8_[s][l] = m_.new_buffer(s8);
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        err = std::string("kv int8 V alloc: ") + e.what();
+        return false;
     }
-    // Data is not migrated: the caller has to reset() and refill the cache.
-    kv_i8_ = on;
     return true;
+}
+
+bool Engine::alloc_kv_for_mode(KvMode m, std::string& err) {
+    if (kv_mode_k_int8(m)) {
+        if (!alloc_k_int8(err)) return false;
+    } else if (!alloc_k_bf16(err)) {
+        return false;
+    }
+    if (kv_mode_v_int8(m)) {
+        if (!alloc_v_int8(err)) return false;
+    } else if (!alloc_v_bf16(err)) {
+        return false;
+    }
+    return true;
+}
+
+bool Engine::set_kv_mode(KvMode m, std::string& err) {
+    if (!alloc_kv_for_mode(m, err)) return false;
+    // Data is not migrated: the caller has to reset() and refill the cache.
+    kv_mode_ = m;
+    return true;
+}
+
+bool Engine::set_kv_int8(bool on, std::string& err) {
+    return set_kv_mode(on ? KvMode::Int8 : KvMode::Bf16, err);
+}
+
+const char* Engine::kv_mode_name(KvMode m) {
+    switch (m) {
+        case KvMode::Bf16: return "bf16";
+        case KvMode::Int8: return "int8";
+        case KvMode::K8V16: return "K int8 / V bf16";
+        case KvMode::K16V8: return "K bf16 / V int8";
+    }
+    return "?";
 }
 
 size_t Engine::kv_cache_bytes() const {
     size_t n = 0;
     for (int l = 0; l < 24; ++l) {
         if (!is_attention_layer(l)) continue;
-        if (kv_i8_ && kc8_[l]) {
-            n += kc8_[l]->length() + vc8_[l]->length() + ks8_[l]->length() +
-                 vs8_[l]->length();
-        } else if (kc_[l]) {
-            n += kc_[l]->length() + vc_[l]->length();
-        }
+        if (k_int8() && kc8_[l]) n += kc8_[l]->length() + ks8_[l]->length();
+        else if (kc_[l]) n += kc_[l]->length();
+        if (v_int8() && vc8_[l]) n += vc8_[l]->length() + vs8_[l]->length();
+        else if (vc_[l]) n += vc_[l]->length();
     }
     return n;
 }
 
+MTL::Buffer* Engine::kv_k(int layer) const {
+    return (!k_int8() && is_attention_layer(layer)) ? kc_[layer] : nullptr;
+}
+
+MTL::Buffer* Engine::kv_v(int layer) const {
+    return (!v_int8() && is_attention_layer(layer)) ? vc_[layer] : nullptr;
+}
+
 MTL::Buffer* Engine::kv_k8(int layer) const {
-    return (kv_i8_ && is_attention_layer(layer)) ? kc8_[layer] : nullptr;
+    return (k_int8() && is_attention_layer(layer)) ? kc8_[layer] : nullptr;
 }
 
 MTL::Buffer* Engine::kv_v8(int layer) const {
-    return (kv_i8_ && is_attention_layer(layer)) ? vc8_[layer] : nullptr;
+    return (v_int8() && is_attention_layer(layer)) ? vc8_[layer] : nullptr;
 }
 
 MTL::Buffer* Engine::kv_ks(int layer) const {
-    return (kv_i8_ && is_attention_layer(layer)) ? ks8_[layer] : nullptr;
+    return (k_int8() && is_attention_layer(layer)) ? ks8_[layer] : nullptr;
 }
 
 MTL::Buffer* Engine::kv_vs(int layer) const {
-    return (kv_i8_ && is_attention_layer(layer)) ? vs8_[layer] : nullptr;
+    return (v_int8() && is_attention_layer(layer)) ? vs8_[layer] : nullptr;
 }
 
 bool Engine::is_attention_layer(int layer) {
@@ -295,14 +360,6 @@ int Engine::layer_kind(int layer) {
 uint32_t Engine::weight_offset(const Tensor& t) const {
     auto it = woff_.find(t.name);
     return it == woff_.end() ? 0u : it->second;
-}
-
-MTL::Buffer* Engine::kv_k(int layer) const {
-    return is_attention_layer(layer) ? kc_[layer] : nullptr;
-}
-
-MTL::Buffer* Engine::kv_v(int layer) const {
-    return is_attention_layer(layer) ? vc_[layer] : nullptr;
 }
 
 MTL::Buffer* Engine::conv_state(int layer) const {
@@ -364,31 +421,59 @@ void Engine::attn_layer(int layer, int pos) {
                                    ".self_attn.k_norm.weight"),
             kn_, 4, 128, 1e-5f);
     rope(m_, e_, qn_, kn_, (uint32_t)pos, theta, partial);
-    if (kv_i8_) {
+    const KvMode mode = kv_mode_;
+    if (mode == KvMode::Int8) {
         kv_append_i8(m_, e_, kn_, v_, kc8_[layer], vc8_[layer], ks8_[layer], vs8_[layer],
                      (uint32_t)pos, kMaxSeq, 4);
-    } else {
+    } else if (mode == KvMode::Bf16) {
         kv_append(m_, e_, kn_, v_, kc_[layer], vc_[layer], (uint32_t)pos, 4096, 4);
+    } else if (k_int8()) {   // K int8 + V bf16
+        kv_append_i8(m_, e_, kn_, v_, kc8_[layer], dummy_i8_, ks8_[layer], dummy_scale_,
+                     (uint32_t)pos, kMaxSeq, 4, 1);
+        kv_append(m_, e_, kn_, v_, dummy_bf16_, vc_[layer], (uint32_t)pos, 4096, 4, 2);
+    } else {                 // K bf16 + V int8
+        kv_append(m_, e_, kn_, v_, kc_[layer], dummy_bf16_, (uint32_t)pos, 4096, 4, 1);
+        kv_append_i8(m_, e_, kn_, v_, dummy_i8_, vc8_[layer], dummy_scale_, vs8_[layer],
+                     (uint32_t)pos, kMaxSeq, 4, 2);
     }
-    if (type == 1 && pos >= 512) {
-        const uint32_t splits = 16;
-        if (kv_i8_) {
+    const uint32_t window = (type == 2) ? 256u : 0u;
+    if (mode == KvMode::Int8) {
+        if (type == 1 && pos >= 512) {
+            const uint32_t splits = 16;
             attn_decode_split_i8(m_, e_, qn_, kc8_[layer], vc8_[layer], ks8_[layer],
                                  vs8_[layer], pacc_, pm_, pl_, (uint32_t)pos, kMaxSeq, 4,
                                  splits);
+            attn_combine(m_, e_, pacc_, pm_, pl_, attn_, splits);
         } else {
+            attn_decode_i8(m_, e_, qn_, kc8_[layer], vc8_[layer], ks8_[layer], vs8_[layer],
+                           attn_, (uint32_t)pos, kMaxSeq, 4, window);
+        }
+    } else if (mode == KvMode::Bf16) {
+        if (type == 1 && pos >= 512) {
+            const uint32_t splits = 16;
             attn_decode_split(m_, e_, qn_, kc_[layer], vc_[layer], pacc_, pm_, pl_,
                               (uint32_t)pos, 4096, 4, splits);
-        }
-        attn_combine(m_, e_, pacc_, pm_, pl_, attn_, splits);
-    } else {
-        if (kv_i8_) {
-            attn_decode_i8(m_, e_, qn_, kc8_[layer], vc8_[layer], ks8_[layer], vs8_[layer],
-                           attn_, (uint32_t)pos, kMaxSeq, 4,
-                           (type == 2) ? 256u : 0u);
+            attn_combine(m_, e_, pacc_, pm_, pl_, attn_, splits);
         } else {
             attn_decode(m_, e_, qn_, kc_[layer], vc_[layer], attn_, (uint32_t)pos, 4096, 4,
-                        (type == 2) ? 256u : 0u);
+                        window);
+        }
+    } else {
+        MTL::Buffer* kbf = k_int8() ? dummy_bf16_ : kc_[layer];
+        MTL::Buffer* k8 = k_int8() ? kc8_[layer] : dummy_i8_;
+        MTL::Buffer* ksc = k_int8() ? ks8_[layer] : dummy_scale_;
+        MTL::Buffer* vbf = v_int8() ? dummy_bf16_ : vc_[layer];
+        MTL::Buffer* v8 = v_int8() ? vc8_[layer] : dummy_i8_;
+        MTL::Buffer* vsc = v_int8() ? vs8_[layer] : dummy_scale_;
+        const uint32_t ki = k_int8() ? 1u : 0u;
+        if (type == 1 && pos >= 512) {
+            const uint32_t splits = 16;
+            attn_decode_split_mix(m_, e_, qn_, kbf, k8, ksc, vbf, v8, vsc, pacc_, pm_, pl_,
+                                  (uint32_t)pos, kMaxSeq, 4, splits, ki);
+            attn_combine(m_, e_, pacc_, pm_, pl_, attn_, splits);
+        } else {
+            attn_decode_mix(m_, e_, qn_, kbf, k8, ksc, vbf, v8, vsc, attn_,
+                            (uint32_t)pos, kMaxSeq, 4, window, ki);
         }
     }
     gate_mul(m_, e_, attn_, gate_, agated_, 2048);
@@ -471,36 +556,44 @@ void Engine::p_attn(int layer, int T, int start) {
     const bool partial = (type == 1);
     const float theta = partial ? 1000000.0f : 10000.0f;
     rope_b(m_, e_, pqn_, pkn_, T, (uint32_t)start, theta, partial);
-    if (kv_i8_) {
+    const KvMode mode = kv_mode_;
+    if (mode == KvMode::Int8) {
         kv_write_b_i8(m_, e_, pkn_, pv_, kc8_[layer], vc8_[layer], ks8_[layer],
                       vs8_[layer], (uint32_t)T, (uint32_t)start, kMaxSeq);
-    } else {
+    } else if (mode == KvMode::Bf16) {
         kv_write_b(m_, e_, pkn_, pv_, kc_[layer], vc_[layer], T, (uint32_t)start, 4096);
+    } else if (k_int8()) {   // K int8 + V bf16
+        kv_write_b_i8(m_, e_, pkn_, pv_, kc8_[layer], dummy_i8_, ks8_[layer],
+                      dummy_scale_, (uint32_t)T, (uint32_t)start, kMaxSeq, 1);
+        kv_write_b(m_, e_, pkn_, pv_, dummy_bf16_, vc_[layer], T, (uint32_t)start, 4096, 2);
+    } else {                 // K bf16 + V int8
+        kv_write_b(m_, e_, pkn_, pv_, kc_[layer], dummy_bf16_, T, (uint32_t)start, 4096, 1);
+        kv_write_b_i8(m_, e_, pkn_, pv_, dummy_i8_, vc8_[layer], dummy_scale_,
+                      vs8_[layer], (uint32_t)T, (uint32_t)start, kMaxSeq, 2);
     }
     const uint32_t seq = (uint32_t)(start + T);
+    const uint32_t kbase = (uint32_t)kMaxSeq * kHeadDim * 2;        // bf16 bytes / head
+    const uint32_t vbase = (uint32_t)kHeadDim * kMaxSeq * 2;
+    const uint32_t kbase8 = (uint32_t)kMaxSeq * kHeadDim;           // int8 bytes / head
+    // K scales are [pos][4] and V scales are [4][pos]; both occupy
+    // max_seq * 4 * 2 bytes per head.
+    const uint32_t sbase8 = (uint32_t)kMaxSeq * 4u * 2u;
     for (uint32_t h = 0; h < 16; ++h) {
         const uint32_t kvh = h / 4u;
-        if (kv_i8_) {
-            // K/V stay int8; the GEMM multiplies each element by its bf16
-            // per-token scale on load.
-            const uint32_t kbase8 = (uint32_t)kMaxSeq * kHeadDim;   // bytes / head
-            // K scales are [pos][4] and V scales are [4][pos]; both occupy
-            // max_seq * 4 * 2 bytes per head.
-            const uint32_t sbase8 = (uint32_t)kMaxSeq * 4u * 2u;    // bytes / head
+        if (k_int8()) {
             gemm_naive_qk_i8(m_, e_, pqn_, kc8_[layer], ks8_[layer], scores_, T, seq, 128,
                              2048, 128, seq, h * 128 * 2, kvh * kbase8, kvh * sbase8, 0);
-            softmax_prefill(m_, e_, scores_, scores_bf_, T, seq, (uint32_t)start,
-                            type == 2);
+        } else {
+            gemm_naive(m_, e_, pqn_, kc_[layer], scores_, T, seq, 128,
+                       2048, 128, seq, h * 128 * 2, kvh * kbase, 0);
+        }
+        softmax_prefill(m_, e_, scores_, scores_bf_, T, seq, (uint32_t)start,
+                        type == 2);
+        if (v_int8()) {
             gemm_naive_pv_i8(m_, e_, scores_bf_, vc8_[layer], vs8_[layer], pattn_, T, 128,
                              seq, seq, 4096, 2048, 0, kvh * kbase8, kvh * sbase8,
                              h * 128 * 4);
         } else {
-            const uint32_t kbase = (uint32_t)4096 * 128 * 2;
-            const uint32_t vbase = (uint32_t)128 * 4096 * 2;
-            gemm_naive(m_, e_, pqn_, kc_[layer], scores_, T, seq, 128,
-                       2048, 128, seq, h * 128 * 2, kvh * kbase, 0);
-            softmax_prefill(m_, e_, scores_, scores_bf_, T, seq, (uint32_t)start,
-                            type == 2);
             gemm_naive(m_, e_, scores_bf_, vc_[layer], pattn_, T, 128, seq,
                        seq, 4096, 2048, 0, kvh * vbase, h * 128 * 4);
         }
@@ -696,38 +789,56 @@ void Engine::snapshot(int slot) {
     if (slot < 0 || slot >= kSnapshotSlots) return;
     for (int l = 0; l < 24; ++l) {
         if (kLayerSuffix[l][0] == 's') {
-            if (kv_i8_) {
+            if (k_int8()) {
                 const size_t kb = (size_t)pos_ * kHeadDim;
-                const size_t sb = (size_t)pos_ * 2;
                 const size_t skb = (size_t)pos_ * 4 * 2;   // K scales [pos][4]
                 for (int h = 0; h < kKvHeads; ++h) {
                     const size_t off = (size_t)h * kMaxSeq * kHeadDim;
                     if (kb) {
                         memcpy((uint8_t*)snap_kc8_[slot][l]->contents() + off,
                                (const uint8_t*)kc8_[l]->contents() + off, kb);
-                        memcpy((uint8_t*)snap_vc8_[slot][l]->contents() + off,
-                               (const uint8_t*)vc8_[l]->contents() + off, kb);
                     }
                     const size_t ksoff = (size_t)h * kMaxSeq * 4 * 2;
                     if (skb) {
                         memcpy((uint8_t*)snap_ks8_[slot][l]->contents() + ksoff,
                                (const uint8_t*)ks8_[l]->contents() + ksoff, skb);
                     }
-                    for (int g = 0; g < 4; ++g) {
-                        const size_t vsoff = ((size_t)h * 4 + g) * kMaxSeq * 2;
-                        if (sb) {
-                            memcpy((uint8_t*)snap_vs8_[slot][l]->contents() + vsoff,
-                                   (const uint8_t*)vs8_[l]->contents() + vsoff, sb);
-                        }
-                    }
                 }
             } else {
                 for (int h = 0; h < 4; ++h) {
                     const size_t off = (size_t)h * 4096 * 128 * 2;
                     memcpy((uint8_t*)snap_kc_[slot][l]->contents() + off,
-                           (const uint8_t*)kc_[l]->contents() + off, (size_t)pos_ * 128 * 2);
-                    memcpy((uint8_t*)snap_vc_[slot][l]->contents() + off,
-                           (const uint8_t*)vc_[l]->contents() + off, (size_t)pos_ * 128 * 2);
+                           (const uint8_t*)kc_[l]->contents() + off,
+                           (size_t)pos_ * 128 * 2);
+                }
+            }
+            if (v_int8()) {
+                const size_t vb = (size_t)pos_;       // int8 bytes per V row
+                const size_t sb = (size_t)pos_ * 2;   // scale bytes per group
+                for (int h = 0; h < kKvHeads; ++h) {
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        const size_t off = ((size_t)h * kHeadDim + d) * kMaxSeq;
+                        if (vb) {
+                            memcpy((uint8_t*)snap_vc8_[slot][l]->contents() + off,
+                                   (const uint8_t*)vc8_[l]->contents() + off, vb);
+                        }
+                    }
+                    for (int g = 0; g < 4; ++g) {
+                        const size_t off = ((size_t)h * 4 + g) * kMaxSeq * 2;
+                        if (sb) {
+                            memcpy((uint8_t*)snap_vs8_[slot][l]->contents() + off,
+                                   (const uint8_t*)vs8_[l]->contents() + off, sb);
+                        }
+                    }
+                }
+            } else {
+                for (int h = 0; h < 4; ++h) {
+                    for (int d = 0; d < 128; ++d) {
+                        const size_t off = ((size_t)h * 128 + d) * 4096 * 2;
+                        memcpy((uint8_t*)snap_vc_[slot][l]->contents() + off,
+                               (const uint8_t*)vc_[l]->contents() + off,
+                               (size_t)pos_ * 2);
+                    }
                 }
             }
         } else {
@@ -742,39 +853,56 @@ void Engine::restore(int slot) {
     if (slot < 0 || slot >= kSnapshotSlots || !has_snapshot_[slot]) return;
     for (int l = 0; l < 24; ++l) {
         if (kLayerSuffix[l][0] == 's') {
-            if (kv_i8_) {
+            if (k_int8()) {
                 const size_t kb = (size_t)snap_pos_[slot] * kHeadDim;
-                const size_t sb = (size_t)snap_pos_[slot] * 2;
                 const size_t skb = (size_t)snap_pos_[slot] * 4 * 2;
                 for (int h = 0; h < kKvHeads; ++h) {
                     const size_t off = (size_t)h * kMaxSeq * kHeadDim;
                     if (kb) {
                         memcpy((uint8_t*)kc8_[l]->contents() + off,
                                (const uint8_t*)snap_kc8_[slot][l]->contents() + off, kb);
-                        memcpy((uint8_t*)vc8_[l]->contents() + off,
-                               (const uint8_t*)snap_vc8_[slot][l]->contents() + off, kb);
                     }
                     const size_t ksoff = (size_t)h * kMaxSeq * 4 * 2;
                     if (skb) {
                         memcpy((uint8_t*)ks8_[l]->contents() + ksoff,
                                (const uint8_t*)snap_ks8_[slot][l]->contents() + ksoff, skb);
                     }
-                    for (int g = 0; g < 4; ++g) {
-                        const size_t vsoff = ((size_t)h * 4 + g) * kMaxSeq * 2;
-                        if (sb) {
-                            memcpy((uint8_t*)vs8_[l]->contents() + vsoff,
-                                   (const uint8_t*)snap_vs8_[slot][l]->contents() + vsoff,
-                                   sb);
-                        }
-                    }
                 }
             } else {
                 for (int h = 0; h < 4; ++h) {
                     const size_t off = (size_t)h * 4096 * 128 * 2;
                     memcpy((uint8_t*)kc_[l]->contents() + off,
-                           (const uint8_t*)snap_kc_[slot][l]->contents() + off, (size_t)snap_pos_[slot] * 128 * 2);
-                    memcpy((uint8_t*)vc_[l]->contents() + off,
-                           (const uint8_t*)snap_vc_[slot][l]->contents() + off, (size_t)snap_pos_[slot] * 128 * 2);
+                           (const uint8_t*)snap_kc_[slot][l]->contents() + off,
+                           (size_t)snap_pos_[slot] * 128 * 2);
+                }
+            }
+            if (v_int8()) {
+                const size_t vb = (size_t)snap_pos_[slot];
+                const size_t sb = (size_t)snap_pos_[slot] * 2;
+                for (int h = 0; h < kKvHeads; ++h) {
+                    for (int d = 0; d < kHeadDim; ++d) {
+                        const size_t off = ((size_t)h * kHeadDim + d) * kMaxSeq;
+                        if (vb) {
+                            memcpy((uint8_t*)vc8_[l]->contents() + off,
+                                   (const uint8_t*)snap_vc8_[slot][l]->contents() + off, vb);
+                        }
+                    }
+                    for (int g = 0; g < 4; ++g) {
+                        const size_t off = ((size_t)h * 4 + g) * kMaxSeq * 2;
+                        if (sb) {
+                            memcpy((uint8_t*)vs8_[l]->contents() + off,
+                                   (const uint8_t*)snap_vs8_[slot][l]->contents() + off, sb);
+                        }
+                    }
+                }
+            } else {
+                for (int h = 0; h < 4; ++h) {
+                    for (int d = 0; d < 128; ++d) {
+                        const size_t off = ((size_t)h * 128 + d) * 4096 * 2;
+                        memcpy((uint8_t*)vc_[l]->contents() + off,
+                               (const uint8_t*)snap_vc_[slot][l]->contents() + off,
+                               (size_t)snap_pos_[slot] * 2);
+                    }
                 }
             }
         } else {

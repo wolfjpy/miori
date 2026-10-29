@@ -52,26 +52,30 @@ Tower + projector run bf16 MPP tensor-core GEMMs; CPU fp32 reference worst
 per-token cosine 0.999706, max |GPU−CPU| 0.00462. Image splice is bit-identical
 to the token path (`max |Δlogit| = 0`).
 
-## int8 KV (opt-in, `MIORI_KV_INT8=1`)
+## int8 / mixed KV (opt-in)
 
-Symmetric int8 K/V with one bf16 scale per `(kv_head, token)`; bf16 stays the
-default. Measured 2026-10-29 (`docs/checkpoints/C5-int8-kv.md`).
+Symmetric int8 with one bf16 scale per `(kv_head, token, 32-wide d group)`.
+`MIORI_KV_INT8=1` selects full int8; `MIORI_KV_MIX=kv|vk` selects a mixed cache
+where the letter is the quantised side. bf16 stays the default. Measured
+2026-10-29 (`docs/checkpoints/C5-int8-kv-groups.md`, `C5-int8-kv-mixed.md`).
 
-| item | bf16 | int8 (per-32 group scales) |
-|---|---:|---:|
-| Engine KV / sequence | 92.27 MB | 49.02 MB |
-| BatchEngine KV, Bmax=32 | 2952.8 MB | 1568.7 MB |
-| attention KV payload / token @4K | 369.1 MB | 184.5 MB (+2.9 MB scales) |
-| decode 4K (128 tok) | 87.5 tok/s | 87.6 tok/s |
-| prefill 4K | 1630 tok/s | 1620 tok/s |
-| decode 1K | 91.8 tok/s | 91.8 tok/s |
-| PPL `docs/README.md` (1885 pos) | 19.7301 | 19.7364 (+0.032 %) |
-| 4-domain 1K PPL / top-1 / mean KL | — | −0.067 % / 99.34 % / 2.2e-4 |
+| item | bf16 | full int8 | mixed `vk` (K bf16/V int8) |
+|---|---:|---:|---:|
+| Engine KV / sequence | 92.27 MB | 49.02 MB | **70.65 MB** |
+| BatchEngine KV, Bmax=32 × 4K | 2952.8 MB | 1568.7 MB | **2260.7 MB** |
+| 64 × 2K KV (modelled) | 2952.8 MB | 1568.7 MB | **2260.7 MB** |
+| attention KV payload / token @4K | 369.1 MB | 184.5 MB | 276.8 MB |
+| decode 4K (128 tok) | 87.6 tok/s | 87.6 tok/s | **85.2 tok/s** |
+| prefill 4K | 1632 tok/s | 1620 tok/s | 1621 tok/s |
+| decode 1K | 91.1 tok/s | 91.8 tok/s | **89.9 tok/s** |
+| 4-domain 1K PPL / top-1 / mean KL | — | −0.067 % / 99.34 % / 2.2e-4 | **+0.019 % / 99.56 % / 1.46e-4** |
+| strict gate | — | top-1 miss | **PASS** |
 
-No decode speedup: single-stream decode at 4K is not KV-bandwidth-bound. The
-gain is capacity (1.38 GB less batch KV). The strict 99.5 % top-1 project gate
-is still not met, so the flag remains off by default; see
-`docs/checkpoints/C5-int8-kv-groups.md`.
+Full int8 halves the KV but misses the 99.5 % top-1 gate. Mixed `vk` saves
+23.4 % of the KV bytes, passes the gate, and costs ~1.3–2.7 % decode speed
+(mixed-format branch + int8→float conversion); bf16 remains the default.
+Logs: `bench/results/C5-int8/mixed-*`; report
+`docs/checkpoints/C5-int8-kv-mixed.md`.
 
 ## Caches
 
@@ -94,8 +98,8 @@ is still not met, so the flag remains off by default; see
 - 64×2K / 64×4K aggregate target (2.5K output tok/s) is not met.
 - Vision is one image at a time in the tower; multi-image requests encode
   sequentially. No ragged vision batch or vision queue.
-- int8 KV is implemented (per-32 group scales) but opt-in and misses the
-  99.5 % top-1 gate (99.34 % aggregate, PPL −0.07 %, mean KL 2.2e-4); radix
+- int8 KV is opt-in: mixed `MIORI_KV_MIX=vk` passes the gate (top-1 99.56 %,
+  mean KL 1.46e-4) while full `MIORI_KV_INT8=1` misses top-1 (99.34 %); radix
   prefix cache and shared-prefix attention are not implemented.
 - Server batch path uses bf16 MPP; over 8 prompts x 32 tokens it agrees with
   the exact 4-bit path on 89.1% of tokens. `MIORI_EXACT=1` forces the exact

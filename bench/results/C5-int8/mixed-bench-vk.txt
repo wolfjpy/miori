@@ -1,0 +1,18 @@
+=== bf16 1K
+bench: prompt=1024 output=128
+prefill: 0.392 s  2611.3 tok/s
+decode:  1.405 s  91.1 tok/s  (110.4 GB/s effective)
+=== vk 1K
+
+bench: prompt=1024 output=128
+prefill: 0.395 s  2591.2 tok/s
+decode:  1.423 s  89.9 tok/s  (109.0 GB/s effective)
+=== bf16 4K
+bench: prompt=4096 output=128
+prefill: 2.510 s  1632.2 tok/s
+decode:  1.460 s  87.6 tok/s  (106.2 GB/s effective)
+=== vk 4K
+
+bench: prompt=4096 output=128
+prefill: 2.527 s  1620.6 tok/s
+decode:  1.503 s  85.2 tok/s  (103.2 GB/s effective)

@@ -899,10 +899,81 @@ int main(int argc, char** argv) {
         }
         printf("test-kv-int8: decode (pos=%u) max abs err = %.6g, split-K(16) = %.6g\n", pos,
                derr, serr);
+        // ---- mixed K/V decode kernels: one side reads the bf16 cache below.
+        MTL::Buffer* kbf = m.new_buffer(kv_elems * 2);
+        MTL::Buffer* vbf = m.new_buffer(kv_elems * 2);
+        uint16_t* kbfp = (uint16_t*)kbf->contents();
+        uint16_t* vbfp = (uint16_t*)vbf->contents();
+        for (uint32_t h = 0; h < kvh; ++h) {
+            for (uint32_t p2 = 0; p2 < npos; ++p2) {
+                for (uint32_t d = 0; d < dim; ++d) {
+                    const uint32_t r = h * 128u + d;
+                    kbfp[((size_t)h * max_seq + p2) * dim + d] =
+                        kp[(size_t)p2 * 512 + r];
+                    vbfp[((size_t)h * dim + d) * max_seq + p2] =
+                        float_to_bf16(vp[(size_t)p2 * 512 + r]);
+                }
+            }
+        }
+        MTL::Buffer* out_kv = m.new_buffer(2048 * 4);
+        MTL::Buffer* out_vk = m.new_buffer(2048 * 4);
+        {
+            auto cb = m.begin();
+            auto enc = cb->computeCommandEncoder();
+            // mix=vk: K bf16 + V int8 (k_int8 = 0)
+            attn_decode_mix(m, enc, qd, kbf, kc8, ks8, kbf, vc8, vs8, out_vk, pos,
+                            max_seq, kvh, 0, 0);
+            // mix=kv: K int8 + V bf16 (k_int8 = 1)
+            attn_decode_mix(m, enc, qd, kbf, kc8, ks8, vbf, vc8, vs8, out_kv, pos,
+                            max_seq, kvh, 0, 1);
+            enc->endEncoding();
+            m.submit(cb, true);
+        }
+        auto mixed_ref = [&](bool kbf_side, bool vbf_side, const float* got,
+                             double& err) {
+            for (uint32_t h = 0; h < kvh; ++h) {
+                for (uint32_t w = 0; w < 4; ++w) {
+                    const uint32_t qh = h * 4 + w;
+                    float sc[601], mx = -1e30f;
+                    for (uint32_t tt = 0; tt <= pos; ++tt) {
+                        float dot = 0.0f;
+                        for (uint32_t d = 0; d < dim; ++d) {
+                            const float kk = kbf_side
+                                ? bf16_to_float(kbfp[((size_t)h * max_seq + tt) * dim + d])
+                                : kref(h, tt, d);
+                            dot += bf16_to_float(qp[qh * 128 + d]) * kk;
+                        }
+                        sc[tt] = dot * qscale;
+                        mx = std::max(mx, sc[tt]);
+                    }
+                    float sum = 0.0f;
+                    for (uint32_t tt = 0; tt <= pos; ++tt) {
+                        sc[tt] = expf(sc[tt] - mx);
+                        sum += sc[tt];
+                    }
+                    for (uint32_t d = 0; d < dim; ++d) {
+                        float a = 0.0f;
+                        for (uint32_t tt = 0; tt <= pos; ++tt) {
+                            const float vv = vbf_side
+                                ? bf16_to_float(vbfp[((size_t)h * dim + d) * max_seq + tt])
+                                : vref(h, d, tt);
+                            a += (sc[tt] / sum) * vv;
+                        }
+                        err = std::max(err, (double)fabsf(a - got[qh * 128 + d]));
+                    }
+                }
+            }
+        };
+        double mix_kv_err = 0.0, mix_vk_err = 0.0;
+        mixed_ref(false, true, (const float*)out_kv->contents(), mix_kv_err);
+        mixed_ref(true, false, (const float*)out_vk->contents(), mix_vk_err);
+        printf("test-kv-int8: mixed decode K int8/V bf16 err = %.6g, K bf16/V int8 err = "
+               "%.6g\n", mix_kv_err, mix_vk_err);
         printf("test-kv-int8: max quantisation error / 32-group max_abs: K %.3f%%, V %.3f%% "
                "(1/127 = %.2f%%)\n",
                100.0 * kq_rel, 100.0 * vq_rel, 100.0 / 127.0);
-        const bool ok = derr < 5e-4 && serr < 5e-4;
+        const bool ok = derr < 5e-4 && serr < 5e-4 && mix_kv_err < 5e-4 &&
+                        mix_vk_err < 5e-4;
         printf("test-kv-int8: %s\n", ok ? "PASS" : "FAIL");
     } else if (cmd == "test-tokenizer") {
         Tokenizer t;
@@ -982,6 +1053,7 @@ int main(int argc, char** argv) {
         std::string file = "docs/README.md";
         int max_tokens = 1024, decode_len = 32, ctx = 4096;
         bool do_bench = true;
+        Engine::KvMode cand_mode = Engine::KvMode::Int8;
         for (int i = 1; i < argc; ++i) {
             std::string a = argv[i];
             if (a == "--file" && i + 1 < argc) file = argv[++i];
@@ -989,11 +1061,17 @@ int main(int argc, char** argv) {
             else if (a == "--decode" && i + 1 < argc) decode_len = atoi(argv[++i]);
             else if (a == "--ctx" && i + 1 < argc) ctx = atoi(argv[++i]);
             else if (a == "--no-bench") do_bench = false;
+            else if (a == "--mix" && i + 1 < argc) {
+                std::string v = argv[++i];
+                if (v == "kv") cand_mode = Engine::KvMode::K8V16;
+                else if (v == "vk") cand_mode = Engine::KvMode::K16V8;
+                else { fprintf(stderr, "kv-int8-test: --mix must be kv or vk\n"); return 2; }
+            }
         }
         Engine e(m, w);
         if (!e.init(err)) { fprintf(stderr, "engine: %s\n", err.c_str()); return 1; }
         // The comparison always runs bf16 first, regardless of the env flag.
-        if (!e.set_kv_int8(false, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
+        if (!e.set_kv_mode(Engine::KvMode::Bf16, err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
         const size_t kv_bf16_bytes = e.kv_cache_bytes();
 
         std::ifstream f(file);
@@ -1022,10 +1100,11 @@ int main(int argc, char** argv) {
             std::vector<double> nll;
             double ppl = 0.0;
         };
-        auto run_pass = [&](bool i8, PassStats& st, std::vector<float>* sampled_out,
+        auto run_pass = [&](Engine::KvMode m, PassStats& st,
+                            std::vector<float>* sampled_out,
                             const std::vector<float>* ref_sampled,
                             std::vector<double>* kls, double* dlogit_sum) -> bool {
-            if (!e.set_kv_int8(i8, err)) {
+            if (!e.set_kv_mode(m, err)) {
                 fprintf(stderr, "kv-int8-test: %s\n", err.c_str());
                 return false;
             }
@@ -1080,11 +1159,12 @@ int main(int argc, char** argv) {
 
         std::vector<float> ref_sampled;
         PassStats ref, cand;
-        if (!run_pass(false, ref, &ref_sampled, nullptr, nullptr, nullptr)) return 1;
+        if (!run_pass(Engine::KvMode::Bf16, ref, &ref_sampled, nullptr, nullptr, nullptr))
+            return 1;
         std::vector<double> kls;
         double dlogit_sum = 0.0;
-        if (!run_pass(true, cand, nullptr, &ref_sampled, &kls, &dlogit_sum)) return 1;
-        const size_t kv_i8_bytes = e.kv_cache_bytes();
+        if (!run_pass(cand_mode, cand, nullptr, &ref_sampled, &kls, &dlogit_sum)) return 1;
+        const size_t kv_cand_bytes = e.kv_cache_bytes();
 
         int agree = 0;
         for (size_t i = 1; i < N; ++i)
@@ -1102,33 +1182,45 @@ int main(int argc, char** argv) {
 
         // Modelled native KV footprint (BatchEngine, all 32 slots) and per-token
         // attention read traffic at 4K context.
-        const double slot_bf16 = 11.0 * 2.0 * 4.0 * 4096.0 * 128.0 * 2.0;
-        const double slot_i8 =
-            11.0 * 2.0 * (4.0 * 4096.0 * 128.0 + 4.0 * 4096.0 * 4.0 * 2.0);
-        const double kv_tok_bf16 = 11.0 * 16.0 * 4096.0 * 128.0 * 2.0 * 2.0;
-        const double kv_tok_i8 = 11.0 * 16.0 * 4096.0 * 128.0 * 1.0 * 2.0;
+        auto slot_bytes = [](Engine::KvMode m) {
+            const double k = Engine::kv_mode_k_int8(m)
+                                 ? 4.0 * 4096.0 * 128.0 + 4.0 * 4096.0 * 4.0 * 2.0
+                                 : 4.0 * 4096.0 * 128.0 * 2.0;
+            const double v = Engine::kv_mode_v_int8(m)
+                                 ? 4.0 * 4096.0 * 128.0 + 4.0 * 4096.0 * 4.0 * 2.0
+                                 : 4.0 * 4096.0 * 128.0 * 2.0;
+            return 11.0 * (k + v);
+        };
+        auto kv_tok_bytes = [](Engine::KvMode m) {
+            const double k = Engine::kv_mode_k_int8(m) ? 1.0 : 2.0;
+            const double v = Engine::kv_mode_v_int8(m) ? 1.0 : 2.0;
+            return 11.0 * 16.0 * 4096.0 * 128.0 * (k + v);
+        };
+        const double slot_bf16 = slot_bytes(Engine::KvMode::Bf16);
+        const double slot_cand = slot_bytes(cand_mode);
 
-        printf("\nkv-int8-test: %s, %zu positions (%d KL sample(s))\n", file.c_str(), N - 1,
-               nS);
+        printf("\nkv-int8-test: %s, %zu positions (%d KL sample(s)), candidate %s\n",
+               file.c_str(), N - 1, nS, Engine::kv_mode_name(cand_mode));
         printf("KV bytes: Engine %.2f MB -> %.2f MB (%.1f%%); modelled BatchEngine Bmax=32 "
                "%.1f MB -> %.1f MB (%.1f%%)\n",
-               (double)kv_bf16_bytes / 1e6, (double)kv_i8_bytes / 1e6,
-               100.0 * (double)kv_i8_bytes / (double)kv_bf16_bytes, slot_bf16 * 32.0 / 1e6,
-               slot_i8 * 32.0 / 1e6, 100.0 * slot_i8 / slot_bf16);
-        printf("PPL: bf16 %.4f -> int8 %.4f (delta %+.3f%%)\n", ref.ppl, cand.ppl, ppl_delta);
+               (double)kv_bf16_bytes / 1e6, (double)kv_cand_bytes / 1e6,
+               100.0 * (double)kv_cand_bytes / (double)kv_bf16_bytes, slot_bf16 * 32.0 / 1e6,
+               slot_cand * 32.0 / 1e6, 100.0 * slot_cand / slot_bf16);
+        printf("PPL: bf16 %.4f -> %s %.4f (delta %+.3f%%)\n", ref.ppl,
+               Engine::kv_mode_name(cand_mode), cand.ppl, ppl_delta);
         printf("top-1 agreement: %d/%zu = %.3f%%\n", agree, N - 1, agree_pct);
-        printf("KL(ref||int8) over %d positions: mean %.6g, p99 %.6g, max %.6g; mean "
+        printf("KL(ref||candidate) over %d positions: mean %.6g, p99 %.6g, max %.6g; mean "
                "|dlogit| %.6g\n",
                nS, kl_mean, kl_p99, kl_max, dlogit);
-        printf("modelled attention KV read/token @4K: %.1f MB bf16 -> %.1f MB int8\n",
-               kv_tok_bf16 / 1e6, kv_tok_i8 / 1e6);
+        printf("modelled attention KV read/token @4K: %.1f MB bf16 -> %.1f MB\n",
+               kv_tok_bytes(Engine::KvMode::Bf16) / 1e6, kv_tok_bytes(cand_mode) / 1e6);
 
         const bool gate_doc = agree_pct >= 99.5 && kl_mean <= 1e-3 && kl_p99 <= 5e-3;
-        const bool gate_task = ppl_delta <= 2.0 && agree_pct >= 99.0;
+        const bool gate_success = gate_doc && ppl_delta <= 1.0;
         printf("quality gate (docs/CHECKPOINTS.md 3.4: top-1 >= 99.5%%, mean KL <= 1e-3, "
                "p99 KL <= 5e-3): %s\n", gate_doc ? "PASS" : "FAIL");
-        printf("task target (PPL delta <= +2%%, top-1 >= 99%%): %s\n",
-               gate_task ? "PASS" : "FAIL");
+        printf("success criterion (PPL delta <= +1%% on top of the doc gate): %s\n",
+               gate_success ? "PASS" : "FAIL");
 
         if (do_bench) {
             std::vector<int> body = ids;
@@ -1139,8 +1231,8 @@ int main(int argc, char** argv) {
             if ((int)ids4k.size() > ctx) ids4k.resize(ctx);
             ids4k.insert(ids4k.begin(), 124894);
             if ((int)ids4k.size() > ctx) ids4k.resize(ctx);
-            auto bench = [&](bool i8, double& pre_s, double& dec_s) -> bool {
-                if (!e.set_kv_int8(i8, err)) { fprintf(stderr, "%s\n", err.c_str()); return false; }
+            auto bench = [&](Engine::KvMode m, double& pre_s, double& dec_s) -> bool {
+                if (!e.set_kv_mode(m, err)) { fprintf(stderr, "%s\n", err.c_str()); return false; }
                 GenConfig cfg;
                 cfg.max_tokens = decode_len;
                 cfg.temperature = 0.0f;
@@ -1166,15 +1258,16 @@ int main(int argc, char** argv) {
                 return true;
             };
             double pre_b = 0, dec_b = 0, pre_i = 0, dec_i = 0;
-            if (!bench(false, pre_b, dec_b)) return 1;
-            if (!bench(true, pre_i, dec_i)) return 1;
+            if (!bench(Engine::KvMode::Bf16, pre_b, dec_b)) return 1;
+            if (!bench(cand_mode, pre_i, dec_i)) return 1;
             const double dn = std::max(1, decode_len - 1);
             printf("\n4K bench (prefill %zu tokens, decode %d tokens, greedy):\n",
                    ids4k.size(), decode_len);
             printf("  bf16: prefill %.3f s = %.1f tok/s, decode %.3f s = %.2f tok/s\n", pre_b,
                    ids4k.size() / pre_b, dec_b, dn / dec_b);
-            printf("  int8: prefill %.3f s = %.1f tok/s, decode %.3f s = %.2f tok/s\n", pre_i,
-                   ids4k.size() / pre_i, dec_i, dn / dec_i);
+            printf("  %s: prefill %.3f s = %.1f tok/s, decode %.3f s = %.2f tok/s\n",
+                   Engine::kv_mode_name(cand_mode), pre_i, ids4k.size() / pre_i, dec_i,
+                   dn / dec_i);
             printf("  decode speedup: %.3fx\n", dec_b / dec_i);
         }
     } else if (cmd == "ppl") {
@@ -1218,7 +1311,7 @@ int main(int argc, char** argv) {
         }
         printf("ppl: %.3f over %zu tokens (%s, kv=%s)\n",
                std::exp(nll / (double)(ids.size() - 1)), ids.size() - 1, file.c_str(),
-               kv_i8 ? "int8" : "bf16");
+               Engine::kv_mode_name(e.kv_mode()));
     } else if (cmd == "bench") {
         Tokenizer t;
         if (!t.load("models/tokenizer.json", err)) { fprintf(stderr, "%s\n", err.c_str()); return 1; }
@@ -1448,74 +1541,85 @@ int main(int argc, char** argv) {
                 size_t kv_bad = 0, kv_bytes = 0, cs_bad = 0, cs_bytes = 0;
                 for (int l = 0; l < BatchEngine::kLayers; ++l) {
                     if (Engine::is_attention_layer(l)) {
-                        if (e.kv_int8()) {
-                            const uint8_t* ek = (const uint8_t*)e.kv_k8(l)->contents();
-                            const uint8_t* ev = (const uint8_t*)e.kv_v8(l)->contents();
-                            const uint8_t* eks = (const uint8_t*)e.kv_ks(l)->contents();
-                            const uint8_t* evs = (const uint8_t*)e.kv_vs(l)->contents();
-                            const uint8_t* sk = (const uint8_t*)be.slot_kv_k8(l)->contents();
-                            const uint8_t* sv = (const uint8_t*)be.slot_kv_v8(l)->contents();
-                            const uint8_t* sks = (const uint8_t*)be.slot_kv_ks(l)->contents();
-                            const uint8_t* svs = (const uint8_t*)be.slot_kv_vs(l)->contents();
-                            const size_t kb = (size_t)pos * BatchEngine::kHeadDim;
-                            const size_t sb = (size_t)pos * 2;       // V scale / group
-                            const size_t skb = (size_t)pos * 4 * 2;  // K scales [pos][4]
-                            for (int h = 0; h < BatchEngine::kKvHeads; ++h) {
-                                const size_t head = (size_t)slot * BatchEngine::kKvHeads + h;
-                                const size_t ebase =
-                                    (size_t)h * BatchEngine::kMaxSeq * BatchEngine::kHeadDim;
-                                const size_t sbase =
-                                    head * BatchEngine::kMaxSeq * BatchEngine::kHeadDim;
+                        for (int h = 0; h < BatchEngine::kKvHeads; ++h) {
+                            const size_t head = (size_t)slot * BatchEngine::kKvHeads + h;
+                            if (e.k_int8()) {
+                                const uint8_t* ek = (const uint8_t*)e.kv_k8(l)->contents();
+                                const uint8_t* eks = (const uint8_t*)e.kv_ks(l)->contents();
+                                const uint8_t* sk =
+                                    (const uint8_t*)be.slot_kv_k8(l)->contents();
+                                const uint8_t* sks =
+                                    (const uint8_t*)be.slot_kv_ks(l)->contents();
+                                const size_t kb = (size_t)pos * BatchEngine::kHeadDim;
+                                const size_t skb = (size_t)pos * 4 * 2;
+                                const size_t ebase = (size_t)h * BatchEngine::kMaxSeq *
+                                                     BatchEngine::kHeadDim;
+                                const size_t sbase = head * BatchEngine::kMaxSeq *
+                                                     BatchEngine::kHeadDim;
                                 kv_bad += diff_bytes(ek + ebase, sk + sbase, kb);
                                 kv_bytes += kb;
-                                const size_t esbase = (size_t)h * BatchEngine::kMaxSeq * 4 * 2;
+                                const size_t esbase =
+                                    (size_t)h * BatchEngine::kMaxSeq * 4 * 2;
                                 const size_t ssbase = head * BatchEngine::kMaxSeq * 4 * 2;
                                 kv_bad += diff_bytes(eks + esbase, sks + ssbase, skb);
                                 kv_bytes += skb;
-                                for (int g = 0; g < 4; ++g) {
-                                    const size_t evsb =
-                                        ((size_t)h * 4 + g) * BatchEngine::kMaxSeq * 2;
-                                    const size_t svsb =
-                                        (head * 4 + g) * BatchEngine::kMaxSeq * 2;
-                                    kv_bad += diff_bytes(evs + evsb, svs + svsb, sb);
-                                    kv_bytes += sb;
-                                }
-                                const size_t ebase_v =
-                                    (size_t)h * BatchEngine::kHeadDim * BatchEngine::kMaxSeq;
-                                const size_t sbase_v =
-                                    head * BatchEngine::kHeadDim * BatchEngine::kMaxSeq;
+                            } else {
+                                const uint8_t* ek = (const uint8_t*)e.kv_k(l)->contents();
+                                const uint8_t* sk =
+                                    (const uint8_t*)be.slot_kv_k(l)->contents();
+                                const size_t kb = (size_t)pos * BatchEngine::kHeadDim * 2;
+                                const size_t ebase = (size_t)h * BatchEngine::kMaxSeq *
+                                                     BatchEngine::kHeadDim * 2;
+                                const size_t sbase = head * BatchEngine::kMaxSeq *
+                                                     BatchEngine::kHeadDim * 2;
+                                kv_bad += diff_bytes(ek + ebase, sk + sbase, kb);
+                                kv_bytes += kb;
+                            }
+                            if (e.v_int8()) {
+                                const uint8_t* ev = (const uint8_t*)e.kv_v8(l)->contents();
+                                const uint8_t* evs = (const uint8_t*)e.kv_vs(l)->contents();
+                                const uint8_t* sv =
+                                    (const uint8_t*)be.slot_kv_v8(l)->contents();
+                                const uint8_t* svs =
+                                    (const uint8_t*)be.slot_kv_vs(l)->contents();
+                                const size_t vb = (size_t)pos;
+                                const size_t sb = (size_t)pos * 2;
+                                const size_t ebase_v = (size_t)h * BatchEngine::kHeadDim *
+                                                       BatchEngine::kMaxSeq;
+                                const size_t sbase_v = head * BatchEngine::kHeadDim *
+                                                       BatchEngine::kMaxSeq;
                                 for (int d = 0; d < BatchEngine::kHeadDim; ++d) {
                                     const size_t eo =
                                         ebase_v + (size_t)d * BatchEngine::kMaxSeq;
                                     const size_t so =
                                         sbase_v + (size_t)d * BatchEngine::kMaxSeq;
-                                    kv_bad += diff_bytes(ev + eo, sv + so, (size_t)pos);
-                                    kv_bytes += (size_t)pos;
+                                    kv_bad += diff_bytes(ev + eo, sv + so, vb);
+                                    kv_bytes += vb;
                                 }
-                            }
-                        } else {
-                            const uint8_t* ek = (const uint8_t*)e.kv_k(l)->contents();
-                            const uint8_t* ev = (const uint8_t*)e.kv_v(l)->contents();
-                            const uint8_t* sk = (const uint8_t*)be.slot_kv_k(l)->contents();
-                            const uint8_t* sv = (const uint8_t*)be.slot_kv_v(l)->contents();
-                            const size_t kb = (size_t)pos * BatchEngine::kHeadDim * 2;
-                            for (int h = 0; h < BatchEngine::kKvHeads; ++h) {
-                                const size_t ebase =
-                                    (size_t)h * BatchEngine::kMaxSeq * BatchEngine::kHeadDim * 2;
-                                const size_t sbase = ((size_t)slot * BatchEngine::kKvHeads + h) *
-                                                     BatchEngine::kMaxSeq * BatchEngine::kHeadDim * 2;
-                                kv_bad += diff_bytes(ek + ebase, sk + sbase, kb);
-                                kv_bytes += kb;
-                                const size_t ebase_v =
-                                    (size_t)h * BatchEngine::kHeadDim * BatchEngine::kMaxSeq * 2;
-                                const size_t sbase_v = ((size_t)slot * BatchEngine::kKvHeads + h) *
-                                                       BatchEngine::kHeadDim * BatchEngine::kMaxSeq * 2;
+                                for (int g = 0; g < 4; ++g) {
+                                    const size_t eo =
+                                        ((size_t)h * 4 + g) * BatchEngine::kMaxSeq * 2;
+                                    const size_t so =
+                                        (head * 4 + g) * BatchEngine::kMaxSeq * 2;
+                                    kv_bad += diff_bytes(evs + eo, svs + so, sb);
+                                    kv_bytes += sb;
+                                }
+                            } else {
+                                const uint8_t* ev = (const uint8_t*)e.kv_v(l)->contents();
+                                const uint8_t* sv =
+                                    (const uint8_t*)be.slot_kv_v(l)->contents();
+                                const size_t vb = (size_t)pos * 2;
+                                const size_t ebase_v = (size_t)h * BatchEngine::kHeadDim *
+                                                       BatchEngine::kMaxSeq * 2;
+                                const size_t sbase_v = head * BatchEngine::kHeadDim *
+                                                       BatchEngine::kMaxSeq * 2;
                                 for (int d = 0; d < BatchEngine::kHeadDim; ++d) {
-                                    const size_t eo = ebase_v + (size_t)d * BatchEngine::kMaxSeq * 2;
-                                    const size_t so = sbase_v + (size_t)d * BatchEngine::kMaxSeq * 2;
-                                    const size_t n = (size_t)pos * 2;
-                                    kv_bad += diff_bytes(ev + eo, sv + so, n);
-                                    kv_bytes += n;
+                                    const size_t eo = ebase_v + (size_t)d *
+                                                       BatchEngine::kMaxSeq * 2;
+                                    const size_t so = sbase_v + (size_t)d *
+                                                       BatchEngine::kMaxSeq * 2;
+                                    kv_bad += diff_bytes(ev + eo, sv + so, vb);
+                                    kv_bytes += vb;
                                 }
                             }
                         }

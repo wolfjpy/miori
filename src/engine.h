@@ -53,19 +53,31 @@ public:
     const float* logits() const;
     int pos() const { return pos_; }
 
-    // ---- optional int8 KV (MIORI_KV_INT8=1) -------------------------------
-    // bf16 remains the default. The format is fixed per Engine at init from the
-    // environment; set_kv_int8() switches at runtime for the comparison
-    // harness (it allocates the other format lazily and does not migrate data,
-    // so callers must reset/refill).
-    bool kv_int8() const { return kv_i8_; }
+    // ---- optional int8 / mixed-precision KV --------------------------------
+    // bf16 remains the default. MIORI_KV_INT8=1 selects full int8;
+    // MIORI_KV_MIX=kv selects K int8 + V bf16, MIORI_KV_MIX=vk selects
+    // K bf16 + V int8 (the letter is the quantised side). The int8 side uses
+    // 32-wide group scales. Settings are read at init; set_kv_mode() switches
+    // at runtime for the comparison harness (allocates lazily, does not migrate
+    // data, so callers must reset/refill).
+    enum class KvMode : int { Bf16 = 0, Int8 = 1, K8V16 = 2, K16V8 = 3 };
+    static bool kv_mode_k_int8(KvMode m) { return m == KvMode::Int8 || m == KvMode::K8V16; }
+    static bool kv_mode_v_int8(KvMode m) { return m == KvMode::Int8 || m == KvMode::K16V8; }
+    static const char* kv_mode_name(KvMode m);
+    KvMode kv_mode() const { return kv_mode_; }
+    bool kv_int8() const { return kv_mode_ == KvMode::Int8; }
+    bool k_int8() const { return kv_mode_k_int8(kv_mode_); }
+    bool v_int8() const { return kv_mode_v_int8(kv_mode_); }
+    bool set_kv_mode(KvMode m, std::string& err);
     bool set_kv_int8(bool on, std::string& err);
     // Live KV bytes for the active format (11 attention layers; scales included).
     size_t kv_cache_bytes() const;
-    MTL::Buffer* kv_k8(int layer) const;       // int8 [4][4096][128], null if bf16
-    MTL::Buffer* kv_v8(int layer) const;       // int8 [4][128][4096], null if bf16
-    MTL::Buffer* kv_ks(int layer) const;       // bf16 [4][4096][4] group scales
-    MTL::Buffer* kv_vs(int layer) const;       // bf16 [4][4][4096] group scales
+    MTL::Buffer* kv_k(int layer) const;        // bf16 K when the K side is bf16
+    MTL::Buffer* kv_v(int layer) const;        // bf16 V when the V side is bf16
+    MTL::Buffer* kv_k8(int layer) const;       // int8 K when the K side is int8
+    MTL::Buffer* kv_v8(int layer) const;       // int8 V when the V side is int8
+    MTL::Buffer* kv_ks(int layer) const;       // bf16 [4][4096][4] K group scales
+    MTL::Buffer* kv_vs(int layer) const;       // bf16 [4][4][4096] V group scales
 
     // ---- additive accessors for the C2 batch path -------------------------
     // The single-sequence API above is unchanged; these only expose the state
@@ -77,8 +89,6 @@ public:
     static bool is_attention_layer(int layer);
     // 1 = full attention, 2 = sliding-window attention, 0 = conv layer.
     static int layer_kind(int layer);
-    MTL::Buffer* kv_k(int layer) const;       // [4][4096][128] bf16, null for conv
-    MTL::Buffer* kv_v(int layer) const;       // [4][128][4096] bf16, null for conv
     MTL::Buffer* conv_state(int layer) const;  // live [6][2048] f32, null for attn
     double last_prefill_s() const { return last_prefill_s_; }
     double last_decode_s() const { return last_decode_s_; }
@@ -157,7 +167,12 @@ private:
     MTL::Buffer* vc8_[24] = {};
     MTL::Buffer* ks8_[24] = {};
     MTL::Buffer* vs8_[24] = {};
-    bool kv_i8_ = false;
+    KvMode kv_mode_ = KvMode::Bf16;
+    // Small scratch handles for the inactive side of a mixed writer/reader
+    // (never read or written when masked out).
+    MTL::Buffer* dummy_bf16_ = nullptr;
+    MTL::Buffer* dummy_i8_ = nullptr;
+    MTL::Buffer* dummy_scale_ = nullptr;
     MTL::Buffer* cs_[24][2] = {};
     int cs_cur_[24] = {};
     MTL::CommandBuffer* cb_ = nullptr;
@@ -180,8 +195,11 @@ private:
     void p_ffn(int layer, int T);
     void p_post(int layer, const char* norm_name, MTL::Buffer* src, int T);
     void post_norm_add(int layer, const char* norm_name, MTL::Buffer* src);
-    bool alloc_bf16_kv(std::string& err);
-    bool alloc_int8_kv(std::string& err);
+    bool alloc_k_bf16(std::string& err);
+    bool alloc_v_bf16(std::string& err);
+    bool alloc_k_int8(std::string& err);
+    bool alloc_v_int8(std::string& err);
+    bool alloc_kv_for_mode(KvMode m, std::string& err);
 };
 
 }  // namespace miori

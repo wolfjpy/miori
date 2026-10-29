@@ -7,6 +7,10 @@
 - Status: **NO-GO for the strict C5 gate** — mean KL, p99 KL and PPL clear; top-1
   reaches 99.34 % aggregate vs the 99.5 % gate, so int8 KV remains opt-in and
   bf16 remains the default.
+- **Follow-up (same day):** mixed K bf16 + V int8 (`MIORI_KV_MIX=vk`) passes the
+  strict gate (top-1 99.560 %, mean KL 1.46e-4); this report's 32-group full-int8
+  numbers remain the reference for the full-int8 mode. See
+  [`C5-int8-kv-mixed.md`](C5-int8-kv-mixed.md).
 
 This report supersedes the scale layout and quality numbers in
 [`C5-int8-kv.md`](C5-int8-kv.md); the kernel/structure notes there still apply.

@@ -1,0 +1,9 @@
+=== bf16 default
+ppl: 24.064 over 1023 tokens (docs/README.md, kv=bf16)
+test-kv-int8: PASS
+=== full int8
+ppl: 24.061 over 1023 tokens (docs/README.md, kv=int8)
+=== mixed vk
+ppl: 24.092 over 1023 tokens (docs/README.md, kv=K bf16 / V int8)
+=== packed prefill vk
+RESULT: packed prefill is bit-identical to the sequential path (first-token logits, KV, conv state) and 3.57x faster

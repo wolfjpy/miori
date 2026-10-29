@@ -19,7 +19,7 @@ No Python, no Objective-C, no MLX runtime: hand-written Metal kernels and a C++ 
 | Vision in the HTTP API | working, one base64 image per request |
 | Multi-image batch / vision queue | **not implemented** |
 | Paged KV / continuous batching | **not implemented** |
-| int8 KV (opt-in) | working behind `MIORI_KV_INT8=1`: Engine + BatchEngine, decode/prefill/snapshot, per-32 group scales; KV bytes 53.1 % (2.95 GB → 1.57 GB at Bmax=32); PPL −0.07 %, top-1 99.34 % (misses the 99.5 % strict gate, so bf16 is default) |
+| int8 KV (opt-in) | Engine + BatchEngine, decode/prefill/snapshot, 32-group scales. `MIORI_KV_MIX=vk` (K bf16, V int8) **passes** the gate: top-1 99.560 %, PPL +0.019 %, mean KL 1.46e-4, KV 76.6 % (2.95 → 2.26 GB at Bmax=32). Full `MIORI_KV_INT8=1` is 53.1 % KV but misses top-1 (99.34 %). bf16 is default |
 | Shared-prefix attention / radix cache | **not implemented** |
 
 Measured on the target M6/16GB (headless, 3-run median where applicable):
@@ -101,8 +101,9 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
 ./build/miori test-mpp-tile          # 32- vs 64-row MPP tile numerics (bit-identical)
 ./build/miori batch-prefill-test     # 64 packed prompts vs sequential prefill: timing + logits/KV diff
 ./build/miori batch-prefill-test --n 64 --repeat 3 --state-check 4 --long 423 [--words]
-./build/miori test-kv-int8          # int8 KV writers/attention/prefill GEMM vs CPU reference
+./build/miori test-kv-int8          # int8/mixed KV writers/attention/prefill GEMM vs CPU reference
 ./build/miori kv-int8-test --file docs/README.md --tokens 1024  # bf16 vs int8 quality gate
+./build/miori kv-int8-test --file docs/README.md --tokens 1024 --mix vk  # mixed K bf16 / V int8
 ```
 
 ## Known limitations
@@ -114,10 +115,10 @@ curl -s http://127.0.0.1:8080/v1/chat/completions \
   pass (`MIORI_BATCH_PREFILL` in the server, on by default; set `=0` to disable); longer prompts
   fall back to the sequential prefill. See `docs/checkpoints/C2-batching.md`.
 - No paged KV and no shared-prefix/radix cache (only 4 full-prefix snapshots).
-  The optional int8 KV (`MIORI_KV_INT8=1`, per-32 group scales) cuts KV memory
-  to 53.1 % but misses the project's 99.5 % top-1 gate (99.34 % aggregate,
-  PPL −0.07 %, mean KL 2.2e-4), so bf16 is the default; see
-  `docs/checkpoints/C5-int8-kv-groups.md`.
+  Optional int8 KV: `MIORI_KV_MIX=vk` (K bf16, V int8) passes the project gate
+  (top-1 99.560 %, PPL +0.019 %, mean KL 1.46e-4) at 76.6 % of the KV bytes;
+  full `MIORI_KV_INT8=1` is 53.1 % but misses the top-1 gate (99.34 %). Both
+  are opt-in and bf16 is the default; see `docs/checkpoints/C5-int8-kv-mixed.md`.
 - Vision works from the CLI only (`vision-run`, `vision-test`); the HTTP API has
   no image input yet, there is no multi-image batch and no vision feature cache.
 - Vision attention still materialises the 16 × N² score matrices (about 2 GB of
@@ -171,6 +172,7 @@ first tokens 64/64 identical, first-token logits 0/8192000 differ, KV+conv state
 ```bash
 ./build/miori ppl --file /tmp/en.txt --tokens 200
 ./build/miori ppl --file docs/README.md --tokens 1024 --kv-int8   # int8 KV PPL
+./build/miori kv-int8-test --file docs/README.md --tokens 512 --mix vk  # mixed quality gate
 ./build/miori kv-int8-test --file docs/README.md --tokens 1024  # bf16 vs int8: PPL/top-1/KL + 4K decode
-./build/miori test-kv-int8                                      # int8 KV kernels vs CPU reference
+./build/miori test-kv-int8                                      # int8/mixed KV kernels vs CPU reference
 ```
