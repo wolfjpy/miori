@@ -153,3 +153,16 @@ path; it composes with `stream:true`. Verified: `What is 2+2?` with
 
 `kv` reflects `MIORI_KV_MIX`/`MIORI_KV_INT8`; `exact` reflects the process-level
 `MIORI_EXACT`.
+
+## Startup warmup
+
+The server now runs a one-token text warmup through both the single Engine and
+the BatchEngine before accepting requests (touches all 24 layers, the bf16
+weight cache, lm_head and the batch buffers). `MIORI_NO_WARMUP=1` disables it.
+
+First `2+2` request after startup, 20 s after launch:
+
+```
+no warmup: 0.179 s, second 0.055 s
+warmup:    0.148 s, second 0.048 s
+```

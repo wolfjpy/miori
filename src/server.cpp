@@ -819,6 +819,19 @@ int run_server(Metal& m, Weights& w, int port) {
         return 1;
     }
     be.set_kernels(BatchEngine::Kernels::MppBf16);
+    if (!getenv("MIORI_NO_WARMUP")) {
+        std::lock_guard<std::mutex> lk(mu);
+        auto wids = tok.chat("You are a helpful assistant.", "Hello", false);
+        eng.reset();
+        eng.prefill_ids(wids, true);
+        GenConfig wc;
+        wc.max_tokens = 1;
+        wc.temperature = 0.0f;
+        eng.decode_loop(wc);
+        be.add_sequence(wids, 1);
+        while (be.running() > 0) be.decode_step();
+        be.clear_slots();
+    }
     Scheduler sched(eng, be, mu);
     std::thread([&sched]() { sched.run(); }).detach();
 
