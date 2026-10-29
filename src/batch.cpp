@@ -47,6 +47,7 @@ bool BatchEngine::init(std::string& err) {
         gatedb_ = buf((size_t)kRows * kHidden * 4);
         hlastb_ = buf((size_t)kRows * kHidden * 2);
         logitsb_ = buf((size_t)kBmax * kVocab * 4);
+        embb16_ = buf((size_t)kVocab * kHidden * 2);
         embb_ = buf((size_t)kRows * kHidden * 2);
         tokb_ = buf(64 * 4);
         posb_ = buf(64 * 4);
@@ -75,6 +76,13 @@ bool BatchEngine::init(std::string& err) {
 
         err.clear();
         if (!load_weights(err)) return false;
+        {
+            cb_ = m_.begin();
+            e_ = cb_->computeCommandEncoder();
+            dequant8(m_, e_, w_, *emb_q_, *emb_s_, *emb_b_, embb16_, kVocab, kHidden);
+            e_->endEncoding();
+            m_.submit(cb_, true);
+        }
 
         size_t kv_bytes = 0, cs_bytes = 0;
         for (int l = 0; l < kLayers; ++l) {
@@ -299,6 +307,9 @@ int BatchEngine::decode_step() {
         // One pass over the 8-bit embedding matrix for every slot.
         gemv8_b(m_, e_, w_, *emb_q_, *emb_s_, *emb_b_, hlastb_, logitsb_, kVocab,
                 kHidden, (uint32_t)kBmax);
+    } else if (kBmax > 4) {
+        gemm_naive(m_, e_, hlastb_, embb16_, logitsb_, kBmax, kVocab, kHidden,
+                   kHidden, kHidden, kVocab);
     } else {
         for (int s = 0; s < kBmax; ++s) {
             if (!slots_[s].active || slots_[s].finished) continue;

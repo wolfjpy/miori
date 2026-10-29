@@ -192,3 +192,20 @@ that slot while the remaining slots keep decoding.
 (vs ~2 × 0.45 s for two static batches of four). Prefill for a newly admitted
 request still blocks the batch, because it runs on the shared Engine; batched
 prefill is the next scheduler step.
+
+## Throughput experiment: B=16/32 with bf16 MPP + bf16 lm_head
+
+The per-slot 8-bit lm_head was the scaling bottleneck (B=16: 65 ms/step). Added a
+524 MB bf16 embedding cache and one `gemm_naive` lm_head for all slots:
+
+| B | kernels | ms/step | aggregate | vs single | id drift vs 4-bit ref |
+|---|---:|---:|---:|---:|---:|
+| 4 | gemv4_b | 15.3 | 261 | 2.66x | 0/128 |
+| 16 | MPP + bf16 lm_head | 46.7 | 343 | 3.49x | 12/256 |
+| 32 | MPP + bf16 lm_head | 58.8 | 544 | 5.56x | 0/512 (duplicate prompts) |
+
+B=32 is a real throughput mode, but a single request through a 32-row MPP step
+costs ~59 ms/token (~17 tok/s). A hybrid "small queue → single path, large queue →
+batch" router made 64-concurrency worse (11.8 s vs 3.7 s) because arrivals kept
+seeing a small backlog and serialized through the single path. It was reverted;
+the server default remains **B=4, 4-bit gemv4_b, token-exact**.

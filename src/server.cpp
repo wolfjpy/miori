@@ -93,6 +93,7 @@ public:
         return true;
     }
     size_t depth() { std::lock_guard<std::mutex> lk(mu_); return q_.size(); }
+    int backlog() { std::lock_guard<std::mutex> lk(mu_); return (int)q_.size() + active_cnt_.load(); }
     void run() {
         std::map<int, std::shared_ptr<Job>> active;
         for (;;) {
@@ -123,6 +124,7 @@ public:
                     if (!q_.empty() && q_.front() == j) q_.pop_front();
                 }
                 active[s] = j;
+                active_cnt_.fetch_add(1);
             }
             if (active.empty()) {
                 // Unserviceable request (e.g. prompt too long): drop it instead of spinning.
@@ -148,6 +150,7 @@ public:
                 { std::lock_guard<std::mutex> jl(j->m); j->done = true; }
                 j->cv.notify_all();
                 active.erase(s);
+                active_cnt_.fetch_sub(1);
             }
         }
     }
@@ -157,6 +160,7 @@ private:
     std::mutex mu_;
     std::condition_variable cv_;
     std::deque<std::shared_ptr<Job>> q_;
+    std::atomic<int> active_cnt_{0};
 };
 struct PrefixCache {
     std::string system;

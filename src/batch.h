@@ -147,6 +147,7 @@ private:
     MTL::Buffer* hlastb_ = nullptr;   // [64][2048] bf16
     MTL::Buffer* logitsb_ = nullptr;  // [4][128000] f32
     MTL::Buffer* embb_ = nullptr;     // [64][2048] bf16
+    MTL::Buffer* embb16_ = nullptr;   // [128000][2048] bf16
     MTL::Buffer* tokb_ = nullptr;     // [64] u32
     MTL::Buffer* posb_ = nullptr;     // [64] u32
 

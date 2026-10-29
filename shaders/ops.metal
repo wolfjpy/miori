@@ -747,3 +747,31 @@ kernel void gemv4x2(device const uint4* q [[buffer(0)]],
     acc += simd_shuffle_down(acc, 8);
     if (li == 0u) y[row] = acc;
 }
+
+// 8-bit affine -> bf16 row-major (one thread per 32-weight group).
+kernel void dequant8(device const uint4* q [[buffer(0)]],
+                     device const bfloat* s [[buffer(1)]],
+                     device const bfloat* b [[buffer(2)]],
+                     device bfloat* out [[buffer(3)]],
+                     constant uint& N [[buffer(4)]],
+                     constant uint& K [[buffer(5)]],
+                     uint gid [[thread_position_in_grid]]) {
+    const uint ng = K / 32u;
+    const uint total = N * ng;
+    if (gid >= total) return;
+    const uint row = gid / ng, g = gid % ng;
+    device const uint4* qrow = q + (ulong)row * (K / 16u);
+    const uint4 a = qrow[2u * g];
+    const uint4 c = qrow[2u * g + 1u];
+    const uint ww[8] = {a.x, a.y, a.z, a.w, c.x, c.y, c.z, c.w};
+    const float sc = float(s[(ulong)row * ng + g]);
+    const float bi = float(b[(ulong)row * ng + g]);
+    const ulong base = (ulong)row * K + (ulong)g * 32u;
+    #pragma unroll
+    for (uint wi = 0; wi < 8u; ++wi) {
+        const uint v = ww[wi];
+        #pragma unroll
+        for (uint j = 0; j < 4u; ++j)
+            out[base + wi * 4u + j] = bfloat(float((v >> (8u * j)) & 0xFFu) * sc + bi);
+    }
+}

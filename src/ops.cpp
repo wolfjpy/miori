@@ -546,4 +546,19 @@ void gemv8_b(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
                             MTL::Size::Make(512, 1, 1));
 }
 
+void dequant8(Metal& m, MTL::ComputeCommandEncoder* e, const Weights& w,
+              const Tensor& q, const Tensor& s, const Tensor& b,
+              MTL::Buffer* out, uint32_t N, uint32_t K) {
+    auto p = m.pso("dequant8");
+    e->setComputePipelineState(p);
+    e->setBuffer(w.buffer(), q.begin, 0);
+    e->setBuffer(w.buffer(), s.begin, 1);
+    e->setBuffer(w.buffer(), b.begin, 2);
+    e->setBuffer(out, 0, 3);
+    e->setBytes(&N, sizeof(N), 4);
+    e->setBytes(&K, sizeof(K), 5);
+    uint64_t total = (uint64_t)N * (K / 32);
+    e->dispatchThreads(MTL::Size::Make(total, 1, 1), MTL::Size::Make(256, 1, 1));
+}
+
 }  // namespace miori
