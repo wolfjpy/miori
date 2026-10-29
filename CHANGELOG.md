@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.5
+
+- Final report and honest C1 sustained numbers (85-88 tok/s; 100.4 transient).
+- Regression rerun on v0.3.4; 27k-request soak memory plateau.
+- No functional changes since v0.3.4.
+
 ## v0.3.4
 
 - `/v1/models` reports `owned_by`, `context_length` and `modalities`.
