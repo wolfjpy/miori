@@ -69,10 +69,26 @@ static std::string read_request(int fd, std::string& body) {
     return req.substr(0, hdr);
 }
 
+static std::atomic<long> g_requests{0};
+static std::atomic<long> g_tokens{0};
+
 static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu) {
     std::string body;
     std::string header = read_request(fd, body);
     if (header.empty()) { ::close(fd); return; }
+    if (header.find("GET /metrics") != std::string::npos) {
+        std::string b = "# HELP miori_requests_total Requests served\n"
+                        "# TYPE miori_requests_total counter\n"
+                        "miori_requests_total " + std::to_string(g_requests.load()) + "\n"
+                        "# HELP miori_output_tokens_total Output tokens generated\n"
+                        "# TYPE miori_output_tokens_total counter\n"
+                        "miori_output_tokens_total " + std::to_string(g_tokens.load()) + "\n";
+        std::string r = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: " +
+                        std::to_string(b.size()) + "\r\nConnection: close\r\n\r\n" + b;
+        send_all(fd, r);
+        ::close(fd);
+        return;
+    }
     if (header.find("GET /health") != std::string::npos) {
         std::string b = "{\"status\":\"ok\"}";
         std::string r = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " +
@@ -137,6 +153,8 @@ static void handle(int fd, Engine& eng, Tokenizer& tok, std::mutex& mu) {
         std::lock_guard<std::mutex> lock(mu);
         out = eng.generate(prompt, cfg);
     }
+    g_requests.fetch_add(1);
+    g_tokens.fetch_add((long)out.size());
     std::string text = tok.decode_plain(out);
     std::string id = "chatcmpl-miori";
     if (stream) {

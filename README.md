@@ -104,3 +104,7 @@ Reported on the target M6: prefill 2542 tok/s, decode 94.1 tok/s at 1K context
 (97.5 tok/s at short context), ~114 GB/s effective.
 
 4K context: prefill 1663.7 tok/s, decode 92.2 tok/s.
+
+## Metrics
+
+`GET /metrics` exposes `miori_requests_total` and `miori_output_tokens_total`.
