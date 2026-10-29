@@ -62,3 +62,11 @@ After ~1 h of continuous benchmarking/soak the same binary measured 86-88 tok/s
 at 1K (vs 100.4 tok/s on a fresh v0.3.2 run); this is device thermal/load
 variance, not a code change. The C1 100 tok/s gate should be reported with the
 measurement conditions (fresh boot/cooldown).
+
+## Cooldown recheck
+
+After a 5-minute idle cooldown the same v0.3.4 binary still measured 85.0-88.4
+tok/s decode (1K and short context). The 100.4 tok/s observation during the
+v0.3.2 regression was not reproducible; treat 85-88 tok/s as the sustained
+number on this machine and 100.4 as a transient best-case. C1's 100 tok/s gate
+is therefore **not consistently met**.
