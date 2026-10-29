@@ -33,7 +33,7 @@ macOS 27.0.1, Xcode 27.1). No Python, no Objective-C, no MLX runtime.
 
 | Item | Result |
 |---|---|
-| decode short / 1K / 4K | 98 / 94.1 / 92.2 tok/s (fresh; warm 84-88) |
+| decode short / 1K / 4K | best-case 98 / 94.1 / 92.2 tok/s; sustained 85-88 after cooldown |
 | prefill 512 / 1K / 2K / 4K | 3118 / ~2800 / 2302 / 1664 tok/s |
 | packed prefill 64x23 tok | 2.10 s -> 0.67 s (3.1x), bit-identical |
 | batch B=4 exact / B=32 MPP | 19.6 ms/step / 46.8 ms/step (684 tok/s) |
@@ -45,7 +45,8 @@ macOS 27.0.1, Xcode 27.1). No Python, no Objective-C, no MLX runtime.
 ## Milestone verdicts
 
 - M0/C0 GO (ICB not attempted).
-- M1/C1 GO with exceptions (100.4 fresh vs 84-88 warm).
+- M1/C1 GO with exceptions: 100.4 was transient; sustained 85-88 tok/s
+  after cooldown, so the 100 tok/s gate is not consistently met.
 - M2/C2 PARTIAL: packed prefill + dynamic-M + fixed slots; **64x2K/4K @2.5K
   NO-GO** — 3781-token prompt takes 2.33 s prefill; no paged KV/chunked prefill.
 - M3/C3 PARTIAL: full streaming/API works; 64-concurrency aggregate target not

@@ -13,7 +13,7 @@ tok/s target is **NO-GO** with the current fixed-slot / packed-prefill design.
 | 4-bit / 8-bit GEMV, MPP prefill | exact vs CPU | `C0`, `REGRESSION` |
 | 24-layer text model + KV + conv state | working | `Paris` |
 | Tokenizer + LFM3 chat template | working | `test-tokenizer` |
-| Single-stream decode | 98 tok/s short, 94.1 @1K, 92.2 @4K | `C1` |
+| Single-stream decode | best 98/94.1/92.2; sustained 85-88 (100 gate not consistent) | `C1` |
 | Single-stream prefill | 2.8K @1K, 1.66K @4K | `BENCHMARKS` |
 | Batch decode | Bmax=32, dynamic M, exact GEMV for <=4 slots | `C2` |
 | Packed multi-request prefill | 64x23 tok: 2.10 s -> 0.67 s, bit-identical | `C2` |
@@ -31,8 +31,9 @@ tok/s target is **NO-GO** with the current fixed-slot / packed-prefill design.
 ## Milestone verdicts
 
 - **M0 C0**: GO with exceptions (ICB replay not attempted).
-- **M1 C1**: GO with exceptions — 98 vs 100 tok/s short-context; full CPU top-1
-  matrix not run.
+- **M1 C1**: GO with exceptions — best 100.4 transient, sustained 85-88
+  tok/s after cooldown, so the 100 tok/s gate is not consistently met; full CPU
+  top-1 matrix not run.
 - **M2 C2**: PARTIAL / 2K target **NO-GO**. Packed prefill is bit-identical and
   3.1x faster; dynamic-M batch and exact GEMV for <=4 slots work. No paged KV,
   no chunked continuous prefill, no prefill/decode overlap. A 3781-token prompt
