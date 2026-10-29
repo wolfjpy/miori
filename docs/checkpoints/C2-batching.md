@@ -423,3 +423,9 @@ HTTP, 16 tokens per request:
 
 `batch-test --kernels gemv4` is usable again (exact for ≤4 low slots, MPP
 fallback above).
+
+### Negative result: 8-simdgroup MPP tile
+
+A 64x64 `matmul2d` with `execution_simdgroups<8>` (256 threads) was measured at
+B=32: 48.8 ms/step / 655 tok/s, slightly worse than the 4-group kernel
+(46.8 ms / 684 tok/s). Reverted; 4 simdgroups remains best.

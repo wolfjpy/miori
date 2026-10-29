@@ -646,5 +646,5 @@ void gemm_mpp32(Metal& m, MTL::ComputeCommandEncoder* e, MTL::Buffer* A,
     e->dispatchThreadgroups(MTL::Size::Make(N / 64, (M + 31) / 32, 1), MTL::Size::Make(64, 1, 1));
 }
 
-}  // namespace miori
 
+}  // namespace miori
