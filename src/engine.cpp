@@ -300,7 +300,8 @@ void Engine::p_gemm(MTL::Buffer* A, uint32_t lda, const Tensor& q, const Tensor&
                     uint32_t ldc, uint32_t T) {
     const uint32_t off = woff_.at(q.name);
     if (N % 64u == 0u) {
-        gemm_mpp(m_, e_, A, wbf_, C, T, N, K, off);
+        if (T <= 32) gemm_mpp32(m_, e_, A, wbf_, C, T, N, K, off);
+        else gemm_mpp(m_, e_, A, wbf_, C, T, N, K, off);
     } else {
         gemm_naive(m_, e_, A, wbf_, C, T, N, K, lda, K, ldc, 0, off, 0);
     }
@@ -535,8 +536,8 @@ void Engine::reset() {
     pos_ = 0;
     for (int l = 0; l < 24; ++l) {
         if (kLayerSuffix[l][0] == 's') {
-            memset(kc_[l]->contents(), 0, (size_t)4096 * 512 * 2);
-            memset(vc_[l]->contents(), 0, (size_t)4096 * 512 * 2);
+            // KV beyond pos_ is never read; skipping the 92 MB clear keeps
+            // short-prompt prefill cheap.
         } else {
             for (int k = 0; k < 2; ++k)
                 memset(cs_[l][k]->contents(), 0, (size_t)6 * 2048 * 4);

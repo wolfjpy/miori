@@ -220,6 +220,7 @@ int BatchEngine::add_sequence(const std::vector<int>& prompt, int max_new_tokens
     }
     if (slot < 0) return -1;
 
+    auto t0 = std::chrono::steady_clock::now();
     // 1. Sequential prefill on the shared Engine (bf16 cache already warm).
     eng_.reset();
     eng_.prefill_ids(prompt, true);
@@ -228,6 +229,7 @@ int BatchEngine::add_sequence(const std::vector<int>& prompt, int max_new_tokens
     cfg.temperature = 0.0f;
     const int first = eng_.sample(cfg);
     const int pos = eng_.pos();
+    auto t1 = std::chrono::steady_clock::now();
     if (pos >= kMaxSeq - 1) {
         fprintf(stderr, "batch: prompt too long (%d >= %d)\n", pos, kMaxSeq - 1);
         return -1;
@@ -253,6 +255,7 @@ int BatchEngine::add_sequence(const std::vector<int>& prompt, int max_new_tokens
         }
     }
 
+    auto t2 = std::chrono::steady_clock::now();
     // 3. Copy the live conv state (6 x 2048 floats per conv layer).
     for (int l = 0; l < kLayers; ++l) {
         if (Engine::is_attention_layer(l)) continue;
@@ -261,6 +264,12 @@ int BatchEngine::add_sequence(const std::vector<int>& prompt, int max_new_tokens
         memcpy(dst, eng_.conv_state(l)->contents(), (size_t)kConvState * 4);
     }
 
+    auto t3 = std::chrono::steady_clock::now();
+    if (getenv("MIORI_BATCH_PROFILE"))
+        fprintf(stderr, "add_sequence: prefill %.1f ms kv %.1f ms conv %.1f ms (pos %d)\n",
+                std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                std::chrono::duration<double, std::milli>(t3 - t2).count(), pos);
     Slot& sl = slots_[slot];
     sl.active = true;
     sl.finished = false;

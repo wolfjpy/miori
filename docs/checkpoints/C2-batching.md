@@ -224,3 +224,20 @@ small queues (<4 pending). 64 concurrent 16-token requests: 5.80 s (B=4 exact)
 -> 3.49 s. The B=32 path is coherent but not token-identical to 4-bit GEMV; the
 low-queue path is exact. Batched prefill remains the next bottleneck (~half the
 64-concurrent wall time).
+
+## Prefill profiling (B=32 server)
+
+With `MIORI_BATCH_PROFILE=1`, `add_sequence` for a 23-token prompt on the M6:
+
+```
+prefill 32.6-33.1 ms, KV copy 1.2-2.4 ms, conv copy 0.0 ms
+```
+
+So 64-concurrent prefill-only wall time (~2.3 s) is almost entirely the
+per-request 24-layer prefill graph: ~33 ms each, dominated by ~120 small MPP
+GEMM launches (M=23 but a 64-row tile), not by KV copies. Clearing KV in
+`Engine::reset` was removed (stale positions are never read) but measured
+neutral. The next required change is **packed/batched prefill** (concatenate
+requests, block-diagonal attention, per-request conv state), not more kernel
+tuning; at 64 short prompts the current serial prefill is ~2.3 s of the 3.5 s
+wall time.
